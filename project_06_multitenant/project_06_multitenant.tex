@@ -1,0 +1,597 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{style_minimal}
+
+\fancyhead[L]{\small\textbf{Project 02}}
+\fancyhead[R]{\small Multi-Tenant Database Proxy}
+\fancyfoot[C]{\small\thepage}
+
+\begin{document}
+
+\projecttitle{Multi-Tenant Database Proxy}{C++ or JavaScript}
+
+\section{Problem Statement}
+
+You will build a database proxy that sits in front of a single shared PostgreSQL server and makes it look, to each tenant, as though they have their own isolated database. Many tenants connect to the proxy at the same time; each tenant identifies themselves during the connection handshake; the proxy forwards their queries to PostgreSQL but transparently rewrites them so that each tenant can only see and modify data in their own schema. A tenant running \texttt{SELECT * FROM users} sees only their own users, not anyone else's. A tenant running \texttt{CREATE TABLE orders (...)} creates a table inside their own schema without disturbing any other tenant. From the tenant's point of view, they have their own private database. From the proxy's point of view, there is one PostgreSQL server with dozens of schemas, and the proxy is routing requests based on who sent them.
+
+This is the design used by real multi-tenant SaaS platforms. Heroku Postgres uses variants of it. Supabase uses it. The ``schemas'' feature of PostgreSQL itself was designed specifically to support this pattern. It has significant advantages over the alternatives: compared to running one PostgreSQL instance per tenant, it uses far less memory and disk; compared to putting all tenants in a single unsegmented table with a tenant id column, it gives cleaner isolation, better performance (PostgreSQL can optimize queries that only touch one schema), and better security (a query bug cannot accidentally leak data across tenants because the tenant boundary is enforced outside the application code).
+
+The proxy you will build does four things. First, it speaks enough of the protocol to accept client connections, read requests, and forward them to the backend PostgreSQL. Second, it identifies the tenant at connection time using a simple authentication scheme. Third, it maintains a pool of backend PostgreSQL connections per tenant, so that opening a new tenant session does not require establishing a new connection to PostgreSQL every time. Fourth, it enforces per-tenant resource limits --- how many queries per second a tenant can run, how many concurrent connections they can hold --- so that one misbehaving tenant cannot starve the others. And alongside all of this, it keeps per-tenant usage metrics that could be used for billing in a real system.
+
+You are not implementing the full PostgreSQL wire protocol. That would be a semester's worth of work on its own. Instead, you will build a simple text-based protocol between your client (\texttt{tenant-cli}) and your proxy (\texttt{tenant-proxy}), and the proxy will speak to the backend PostgreSQL using an existing PostgreSQL client library (\texttt{libpq} in C++, \texttt{pg} in JavaScript). This is exactly how real database proxies are built when the front-end protocol does not need to match the back-end --- you use the backend's official library and focus the implementation effort on the proxy logic instead. The teaching goal is not ``write a protocol parser'' (you did that in the Redis and sharding projects); the teaching goal here is \textit{isolation, routing, and resource management}.
+
+\section{What the Final Product Looks Like}
+
+When your project is complete, you can start a PostgreSQL backend, start your proxy pointing at it, and connect multiple tenant clients that each see their own isolated data. A session looks like this.
+
+\begin{codebox}
+\begin{lstlisting}
+# terminal 1: postgres running in docker, or locally
+$ docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=secret postgres:16
+[postgres] ready to accept connections on port 5432
+
+# terminal 2: the proxy
+$ ./tenant-proxy \
+    --port 6000 \
+    --backend localhost:5432 \
+    --backend-user postgres --backend-password secret \
+    --backend-db mydb \
+    --tenants tenants.conf
+[proxy] loaded 3 tenants: acme, globex, initech
+[proxy] ensuring schemas exist on backend...
+[proxy]   schema tenant_acme: ok
+[proxy]   schema tenant_globex: ok
+[proxy]   schema tenant_initech: ok
+[proxy] connection pool: 4 connections per tenant, min 1, max 8
+[proxy] ready on port 6000
+
+# terminal 3: tenant acme
+$ ./tenant-cli --host localhost --port 6000 --tenant acme --api-key acme_k3y
+connected as tenant 'acme' (session id 1)
+
+acme> CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+OK (0 rows, 12ms, pool: 1/4 in use)
+
+acme> INSERT INTO users VALUES (1, 'Ayesha'), (2, 'Bilal'), (3, 'Carol');
+OK (3 rows, 8ms, pool: 1/4 in use)
+
+acme> SELECT * FROM users;
+id | name
+---+-------
+ 1 | Ayesha
+ 2 | Bilal
+ 3 | Carol
+(3 rows, 6ms, pool: 1/4 in use)
+
+# terminal 4: tenant globex
+$ ./tenant-cli --host localhost --port 6000 --tenant globex --api-key globex_k3y
+connected as tenant 'globex' (session id 2)
+
+globex> CREATE TABLE users (id INT PRIMARY KEY, email TEXT);
+OK (0 rows, 9ms, pool: 1/4 in use)
+
+globex> INSERT INTO users VALUES (100, 'bob@globex.com');
+OK (1 rows, 5ms, pool: 1/4 in use)
+
+globex> SELECT * FROM users;
+id  | email
+----+-----------------
+100 | bob@globex.com
+(1 rows, 4ms, pool: 1/4 in use)
+
+# ^ note that globex sees only its own user, not acme's three users.
+#   acme's table has (id, name); globex's has (id, email). Different
+#   schemas, different tables, complete isolation.
+
+acme> SELECT * FROM users;
+id | name
+---+-------
+ 1 | Ayesha
+ 2 | Bilal
+ 3 | Carol
+(3 rows, 6ms, pool: 1/4 in use)
+
+# ^ acme is also unaffected. Neither tenant can see the other.
+
+# what happens if a tenant exceeds its rate limit
+acme> \burst 100  # send 100 queries as fast as possible
+sent 20 queries successfully...
+ERR rate limit exceeded (20 queries per second, retry in 450ms)
+sent 20 more queries...
+ERR rate limit exceeded ...
+
+acme> \stats
+tenant:         acme
+session id:     1
+queries total:  45
+bytes sent:     2184
+bytes recv:     912
+pool in use:    1
+pool idle:      3
+rate limit:     20/sec (current: 18/sec)
+last query:     SELECT 1
+\end{lstlisting}
+\end{codebox}
+
+The defining feature of this session is that three different tenants can all have a table called \texttt{users} with completely different columns and data, and can query it naturally without any awareness of the others. The proxy is doing the work of routing each tenant's queries to their own schema. No tenant's query ever touches another tenant's data, even by accident, because the SQL rewriter in the proxy guarantees it.
+
+\section{Deployment Options}
+
+This project has two pieces to deploy: the backend PostgreSQL server and your proxy. You have several options.
+
+\subsection{Everything Local}
+Run PostgreSQL locally (install it natively, or \texttt{apt install postgresql}), then run your proxy as a normal process. Connect tenant clients to the proxy. Simplest setup.
+
+\subsection{PostgreSQL in Docker, Proxy Local}
+Run only PostgreSQL in a container: \texttt{docker run --rm -p 5432:5432 -e POSTGRES\_PASSWORD=secret postgres:16}. Then run your proxy as a normal process pointing at \texttt{localhost:5432}. This is the recommended development setup because it avoids installing PostgreSQL on your machine and because you can reset state instantly by restarting the container.
+
+\subsection{Everything in Docker Compose}
+A \texttt{docker-compose.yml} with two services: \texttt{postgres} and \texttt{proxy}. The proxy service builds from a \texttt{Dockerfile} in your repository. Clean and reproducible; good for the grader to run on their own machine.
+
+\subsection{Postgres Is Always Required}
+No matter which deployment you choose, PostgreSQL 14 or later must be available as the backend. The proxy is useless without it; the proxy exists specifically to multiplex access to a real backend database. You cannot fake the backend with an in-memory store, because the whole point of the project is that real SQL runs on a real database.
+
+\section{Architectural Overview}
+
+The proxy has four major components. Keep them strictly separated.
+
+\begin{codebox}
+\begin{lstlisting}
+          [ tenant clients ]   (many, one per tenant session)
+                  |
+                  v
+        +---------------------+
+        |  Client listener    |  accept, authenticate, read queries
+        |  (Section 6)        |
+        +---------------------+
+                  |
+                  v
+        +---------------------+
+        |  Query rewriter     |  prefix tables with tenant schema
+        |  (Section 7)        |
+        +---------------------+
+                  |
+                  v
+        +---------------------+
+        |  Rate limiter       |  per-tenant token bucket
+        |  (Section 8)        |
+        +---------------------+
+                  |
+                  v
+        +---------------------+
+        |  Connection pool    |  pre-warmed libpq connections
+        |  (Section 9)        |  per tenant, each bound to the
+        |                     |  tenant's search_path
+        +---------------------+
+                  |
+                  v
+          [ PostgreSQL backend ]
+\end{lstlisting}
+\end{codebox}
+
+Every tenant query passes through every component. The client listener is where the tenant shows up and authenticates. The query rewriter makes sure that unqualified table names (like \texttt{users}) are interpreted as being in the tenant's schema. The rate limiter decides whether the query is allowed to run right now. The connection pool finds an idle backend connection for the tenant and sends the query. The response flows back through the same path in reverse.
+
+\section{The Tenant Configuration}
+
+Tenant configuration is static for this project: a file on disk that the proxy reads at startup. The file has one tenant per line in a simple colon-separated format:
+
+\begin{codebox}
+\begin{lstlisting}
+# tenants.conf
+# format: tenant_id:api_key:rate_limit_per_sec:max_connections
+acme:acme_k3y:20:8
+globex:globex_k3y:50:16
+initech:initech_k3y:10:4
+\end{lstlisting}
+\end{codebox}
+
+For each tenant:
+\begin{itemize}
+\item \texttt{tenant\_id}: a short alphanumeric identifier (lowercase ASCII, no whitespace). Used as the schema name prefix: tenant \texttt{acme} gets the schema \texttt{tenant\_acme}.
+\item \texttt{api\_key}: a string the tenant must present to authenticate. In a real system this would be a per-tenant secret issued by an admin; for this project, a plaintext string in the config file is fine.
+\item \texttt{rate\_limit\_per\_sec}: maximum queries per second this tenant may run. Queries over this rate are rejected with an error (see Section 8).
+\item \texttt{max\_connections}: maximum concurrent sessions this tenant may hold at once. Connection attempts beyond this limit are rejected.
+\end{itemize}
+
+At startup, the proxy reads the config file, validates each line, and for each tenant issues a \texttt{CREATE SCHEMA IF NOT EXISTS tenant\_\textit{tenant\_id}} against the backend. Tenants whose config is malformed cause the proxy to abort at startup with a clear error; there is no dynamic tenant creation.
+
+Dynamic tenant management (reloading the config file, creating tenants at runtime, deleting tenants) is out of scope for the base project but is a bonus.
+
+\section{The Client Protocol}
+
+The proxy speaks its own simple text protocol to clients (\texttt{tenant-cli}). This is \textit{not} the PostgreSQL wire protocol. Using a custom protocol lets you focus the implementation on the proxy logic without having to implement PostgreSQL's binary protocol, which is out of scope.
+
+\subsection{The Connection Handshake}
+When a client connects, the first thing it must send is a \texttt{HELLO} line containing the tenant id and the API key:
+
+\begin{codebox}
+\begin{lstlisting}
+HELLO tenant_id api_key
+\end{lstlisting}
+\end{codebox}
+
+The proxy responds with either \texttt{OK session\_id} (a new session has been opened and its local id is \texttt{session\_id}) or \texttt{ERR} followed by a reason (bad credentials, tenant at connection limit, unknown tenant, etc.). A client that tries to send any other command before the \texttt{HELLO} is disconnected immediately.
+
+\subsection{Per-Session Commands}
+After a successful \texttt{HELLO}, the client can send any of the following commands. Each command is a single line terminated by a newline. Responses may span multiple lines.
+
+\begin{itemize}
+\item \texttt{QUERY sql\_text} --- Execute a SQL query on behalf of this tenant. \texttt{sql\_text} is the raw SQL (which may contain spaces). The proxy rewrites it, rate-limits it, forwards it through the connection pool, and returns the results as described in Section 6.3.
+
+\item \verb|\stats| --- Print session and tenant statistics, including pool usage, query count, and bytes transferred.
+
+\item \verb|\tables| --- List the tables currently in this tenant's schema. A convenience command that is equivalent to running \texttt{SELECT tablename FROM pg\_tables WHERE schemaname = 'tenant\_\textit{tenant\_id}'}.
+
+\item \verb|\burst N| --- Send \texttt{SELECT 1} queries as fast as possible, \texttt{N} of them total. Used for testing the rate limiter. The proxy treats each of these as a normal query; the client just emits them quickly.
+
+\item \texttt{QUIT} --- Close the session. The proxy releases any connection it was using back to the pool and closes the client socket.
+\end{itemize}
+
+\subsection{Query Response Format}
+A \texttt{QUERY} response takes one of three forms:
+
+\textbf{Success with no result rows} (for \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, \texttt{CREATE}, etc.):
+
+\begin{codebox}
+\begin{lstlisting}
+OK (N rows, Tms, pool: X/Y in use)
+\end{lstlisting}
+\end{codebox}
+
+\textbf{Success with result rows} (for \texttt{SELECT}):
+
+\begin{codebox}
+\begin{lstlisting}
+col1 | col2 | col3
+-----+------+-----
+ v11 |  v12 |  v13
+ v21 |  v22 |  v23
+...
+(N rows, Tms, pool: X/Y in use)
+\end{lstlisting}
+\end{codebox}
+
+You do not need perfect column alignment (that is pure polish). A reasonable left-aligned output with pipes and dashes is fine.
+
+\textbf{Error}:
+
+\begin{codebox}
+\begin{lstlisting}
+ERR reason
+\end{lstlisting}
+\end{codebox}
+
+Errors include SQL errors from the backend (syntax errors, constraint violations), rate limit rejections, and any other failure. In the SQL-error case, the message should be the PostgreSQL error text, minus any leading \texttt{ERROR:} prefix.
+
+\section{The Query Rewriter}
+
+This is the heart of the project. When a tenant sends a query like \texttt{SELECT * FROM users}, the proxy must make sure that the \texttt{users} referred to is the \texttt{users} table in the tenant's own schema, not some other tenant's \texttt{users} table, and not PostgreSQL's system-wide \texttt{users} catalog. There are two approaches to achieving this, and you should understand both before choosing.
+
+\subsection{Approach 1: SET search\_path}
+PostgreSQL has a session variable called \texttt{search\_path} that tells the query planner which schemas to look in when a query uses an unqualified table name. If you run \texttt{SET search\_path = tenant\_acme}, then \texttt{SELECT * FROM users} is interpreted as \texttt{SELECT * FROM tenant\_acme.users}. This is a clean, idiomatic PostgreSQL mechanism, and it is the right choice for this project.
+
+The trick is that \texttt{search\_path} is a per-session setting. It is reset whenever the connection is returned to the pool and reused by another tenant. If you give the same backend connection to tenant acme and then to tenant globex without resetting, globex will see acme's tables. This is a serious correctness (and security) bug.
+
+The fix is to make each pooled connection ``belong'' to one tenant at a time, and to issue \texttt{SET search\_path} before handing out the connection to a session. There are two ways to do this:
+
+\begin{enumerate}
+\item \textbf{Per-tenant pools}: the connection pool is actually one pool per tenant. A connection for tenant acme has \texttt{search\_path = tenant\_acme} set on it permanently; it is only ever given to acme sessions. A connection for globex is similarly fixed. This wastes some connections (each tenant reserves a minimum pool size regardless of usage), but it is trivially correct.
+
+\item \textbf{Shared pool with reset}: one global pool. Before each query, the proxy executes \texttt{SET search\_path = tenant\_X; SELECT 1; SELECT result\_of\_actual\_query}, either as one round-trip batch or as two separate round-trips. This is more efficient but has a subtle trap: if you forget to issue the \texttt{SET} on some code path, queries run with the wrong schema silently.
+\end{enumerate}
+
+For this project, use \textbf{per-tenant pools} (approach 1a). It is simpler to reason about, simpler to implement, and the small efficiency loss does not matter at the scale you will be operating. Document your choice.
+
+\subsection{Approach 2: SQL Parsing and Rewriting}
+An alternative is to actually parse the SQL the client sent, find every table reference, and rewrite it to prepend the tenant's schema. So \texttt{SELECT * FROM users u JOIN orders o ON u.id = o.user\_id} becomes \texttt{SELECT * FROM tenant\_acme.users u JOIN tenant\_acme.orders o ON u.id = o.user\_id}. This is the ``purer'' approach because it does not rely on \texttt{search\_path} side effects.
+
+The problem is that parsing SQL correctly is hard. SQL has dozens of forms of table reference: in \texttt{FROM}, in \texttt{JOIN}, in subqueries, in CTEs (\texttt{WITH} clauses), in \texttt{INSERT INTO}, in \texttt{UPDATE}, in \texttt{DELETE FROM}, in \texttt{CREATE TABLE}, and more. Writing a parser that handles every case without breaking legitimate queries is a significant effort, and writing one that handles malicious queries without allowing escape bugs is harder still.
+
+\textbf{This project uses Approach 1 (SET search\_path) as the required baseline.} Approach 2 (full SQL rewriting) is available as a bonus. For the base project, your query rewriter's job is very simple: verify that the query does not contain an explicit schema reference (no dots in table names) and reject the query if it does, then forward the query unchanged to the backend on a connection whose \texttt{search\_path} has been set to the tenant's schema.
+
+\subsection{The Forbidden-Schema Check}
+Because the base project uses \texttt{search\_path} rather than rewriting, a malicious tenant could try to escape their schema by writing an explicit dotted reference: \texttt{SELECT * FROM tenant\_globex.users}. This would work if the backend user has access to both schemas, which it does, because the backend user is the same regardless of the tenant.
+
+The proxy must prevent this. The simplest approach is a regex-based check on the incoming SQL: reject any query whose SQL contains any dotted identifier of the form \texttt{tenant\_X.something}. Also reject any query that contains the keyword \texttt{SET search\_path} (to prevent the tenant from changing their own schema) and the keyword \texttt{SET ROLE} (which would let them impersonate another user). This is a denylist, and denylists are never perfect, but for the scope of this project a denylist is sufficient if it is documented and tested.
+
+A more sophisticated approach using actual SQL parsing is in the bonus. For the base project, the denylist is fine. Your test suite must include test cases that try to escape the schema in various ways and verify they are all rejected.
+
+\subsection{Handling \texttt{CREATE TABLE} and DDL}
+When a tenant runs \texttt{CREATE TABLE orders (...)}, the \texttt{search\_path} mechanism causes the table to be created inside the tenant's schema. This is exactly what you want. No special handling required.
+
+A subtle case: \texttt{ALTER TABLE}, \texttt{DROP TABLE}, and similar DDL statements. All of them respect \texttt{search\_path} for unqualified references. The denylist check from Section 7.3 catches any attempt to qualify a schema explicitly. So DDL Just Works within the tenant's own schema.
+
+\section{The Rate Limiter}
+
+Each tenant has a configured rate limit in queries per second. The proxy must reject queries that exceed this rate, and must do so quickly so that a burst from one tenant does not slow down others.
+
+\subsection{Token Bucket}
+Use a token bucket algorithm, the standard way to implement a rate limit. Each tenant has a bucket with a capacity equal to the rate limit (in tokens, where one query consumes one token). Tokens refill at the rate of the rate limit per second. When a query arrives, the proxy tries to take one token from the bucket: if the bucket has at least one, the query proceeds and the token is removed; if not, the query is rejected with an error.
+
+The bucket's current state is stored in the tenant's per-tenant structure: \texttt{current\_tokens} (a floating-point number, not an integer) and \texttt{last\_refill\_time} (an absolute wall-clock time). Whenever the bucket is accessed:
+
+\begin{enumerate}
+\item Compute \texttt{elapsed} = now $-$ \texttt{last\_refill\_time}.
+\item Add \texttt{elapsed * rate\_limit\_per\_sec} tokens to \texttt{current\_tokens}, capped at the bucket capacity.
+\item Set \texttt{last\_refill\_time} = now.
+\item If \texttt{current\_tokens} $\geq$ 1, subtract 1 and accept the query. Otherwise reject with an error that includes the time until the next token is available.
+\end{enumerate}
+
+The nice property of this algorithm is that it allows bursts up to the bucket capacity, while maintaining a long-term average rate equal to the refill rate. A tenant who has been idle for 10 seconds and then sends 20 queries in quick succession gets all 20 through (assuming a capacity of 20 or more), because their bucket was at full during the idle period.
+
+\subsection{Thread Safety}
+If the proxy is multi-threaded (one thread per client session, which is the recommended approach), the per-tenant bucket is shared between all sessions belonging to that tenant. Protect it with a mutex. Each query takes the mutex briefly (to check and update tokens), then releases it before doing anything slow.
+
+\section{The Connection Pool}
+
+A tenant session does not open its own connection to the backend for every query. Instead, the proxy maintains a pool of pre-opened backend connections per tenant, and sessions borrow connections from the pool for the duration of a single query.
+
+\subsection{Why a Pool}
+Opening a new PostgreSQL connection is expensive: it takes a TCP handshake, authentication, a startup message exchange, and the backend spawns a new server process (PostgreSQL uses a process-per-connection model). The cost is typically 10--50 milliseconds per connection. If every query from a tenant opened a new connection, the proxy would be bottlenecked on connection setup instead of query execution.
+
+The pool amortizes this cost by keeping a handful of connections open at all times. Queries grab an idle one, use it for a few milliseconds, and return it. A steady workload can be served by a very small pool because connections are released quickly.
+
+\subsection{Pool Parameters}
+Each tenant's pool has three parameters:
+
+\begin{itemize}
+\item \texttt{min\_size}: the minimum number of connections the pool maintains even when idle. Set this to 1 (or 2) so that the first query from a tenant is always fast.
+\item \texttt{initial\_size}: the number of connections opened at startup. Set this equal to \texttt{min\_size}.
+\item \texttt{max\_size}: the maximum number of connections the pool may open. Equal to the tenant's \texttt{max\_connections} from the config file. If a session needs a connection and the pool is empty but under \texttt{max\_size}, open a new one. If the pool is empty and at \texttt{max\_size}, the session waits.
+\end{itemize}
+
+Connections in the pool are always bound to the tenant's schema: before being added to the pool, the proxy issues \texttt{SET search\_path = tenant\_\textit{id}} on the connection. This is done once, at creation time, and the setting sticks for the lifetime of the connection (which is effectively forever).
+
+\subsection{Check-Out, Check-In}
+The pool exposes two operations:
+
+\begin{itemize}
+\item \texttt{get\_connection(tenant\_id)}: returns a connection from the tenant's pool. If there is an idle connection, return it immediately. If not and the pool is below \texttt{max\_size}, open a new connection, \texttt{SET search\_path} on it, and return it. If the pool is at \texttt{max\_size}, block the caller until an idle connection is returned.
+
+\item \texttt{release\_connection(conn, tenant\_id)}: return a connection to the tenant's pool. If the connection is still healthy, it becomes idle and is available for the next query. If it is broken (the backend dropped it, a query failed in a way that left the connection in a bad state, etc.), discard it and, if the pool is below \texttt{min\_size}, open a replacement.
+\end{itemize}
+
+For ``still healthy,'' a simple heuristic is: if the last query on the connection returned without throwing an exception, it is healthy. If it threw, discard. A production pool would also ping idle connections periodically to detect silently-broken ones, but for this project the simpler heuristic is fine.
+
+\subsection{Concurrency}
+The pool is shared across sessions and must be thread-safe. Use a mutex around the pool's internal state (the list of idle connections, the count of in-use connections). The mutex is held only briefly during check-out and check-in; the actual query happens without the mutex.
+
+\section{The PostgreSQL Client}
+
+The proxy talks to the backend PostgreSQL using an existing client library. This is the one place in Project 02 where you are allowed to use a third-party library for the core protocol work, because implementing the PostgreSQL wire protocol is out of scope.
+
+\subsection{libpq (C/C++)}
+For C++ implementations, use \texttt{libpq}, the official PostgreSQL C client library. It is included with any PostgreSQL installation and comes with good documentation. The key functions are:
+
+\begin{codebox}
+\begin{lstlisting}
+#include <libpq-fe.h>
+
+PGconn *conn = PQconnectdb(
+    "host=localhost port=5432 user=postgres "
+    "password=secret dbname=mydb");
+
+PGresult *res = PQexec(conn, "SELECT 1");
+if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    // error: PQerrorMessage(conn)
+}
+int rows = PQntuples(res);
+int cols = PQnfields(res);
+const char *value = PQgetvalue(res, row_i, col_i);
+PQclear(res);
+
+PQfinish(conn);
+\end{lstlisting}
+\end{codebox}
+
+That is essentially the entire API you need. Use \texttt{PQexec} for queries; use \texttt{PQntuples}/\texttt{PQnfields}/\texttt{PQgetvalue} to extract results; use \texttt{PQerrorMessage} to get error text. Your build system needs to link against libpq: on Ubuntu, \texttt{apt install libpq-dev} and then \texttt{-lpq} in your linker flags.
+
+\subsection{node-postgres (JavaScript)}
+For JavaScript (Node.js) implementations, use the \texttt{pg} package, the standard PostgreSQL client:
+
+\begin{codebox}
+\begin{lstlisting}
+const { Client } = require('pg');
+
+const client = new Client({
+  host: 'localhost', port: 5432,
+  user: 'postgres', password: 'secret', database: 'mydb',
+});
+
+await client.connect();
+const result = await client.query('SELECT 1');
+console.log(result.rows);
+await client.end();
+\end{lstlisting}
+\end{codebox}
+
+Install with \texttt{npm install pg}. The API is async and promise-based, which fits naturally into a Node.js proxy architecture.
+
+Either language is acceptable for this project. Pick the one your group is more comfortable with; the proxy logic is the same in both.
+
+\section{Metering}
+
+Alongside the rate limiter, the proxy tracks per-tenant usage counters. These are the numbers a real SaaS platform would use for billing. For this project you only need to track them; you do not need to present them in a billing report.
+
+Per tenant, track:
+
+\begin{itemize}
+\item \texttt{queries\_total}: total number of successful queries run.
+\item \texttt{queries\_rejected}: total number of queries rejected by the rate limiter.
+\item \texttt{bytes\_sent}: total number of bytes of SQL text sent to the backend.
+\item \texttt{bytes\_received}: total number of bytes of result data received from the backend.
+\item \texttt{cpu\_ms}: total wall-clock time spent executing queries (an approximation of backend CPU time; use the time from query send to result receive).
+\end{itemize}
+
+The counters are updated inline with query execution and protected by the same per-tenant mutex used by the rate limiter (or a separate one if you prefer finer-grained locking). The \verb|\stats| command reads and displays these numbers for the calling tenant.
+
+\section{Phase 1 --- Client Protocol, Authentication, and a Single Tenant}
+
+The goal of Phase 1 is a proxy that accepts client connections, authenticates them, forwards queries to the backend, and returns the results. One tenant, no rate limiting, no pool (a new connection per query is fine for now), no query rewriting (use \texttt{SET search\_path} manually on each query).
+
+Build these components:
+
+\begin{itemize}
+\item A TCP server that accepts multiple concurrent clients. One thread per client session is the simplest approach.
+
+\item The tenant config file loader with the format from Section 5.
+
+\item A \texttt{HELLO}-based authentication step: verify the tenant id exists in the config and the API key matches. Track the number of open sessions per tenant for the purposes of the \texttt{max\_connections} check.
+
+\item At startup, connect to the backend and issue \texttt{CREATE SCHEMA IF NOT EXISTS} for every tenant in the config.
+
+\item Per session, open a fresh libpq connection to the backend, issue \texttt{SET search\_path = tenant\_\textit{id}} immediately, and then accept \texttt{QUERY} commands from the client. For each query, call \texttt{PQexec}, serialize the result (either ``N rows affected'' or a table of rows), and send it back to the client.
+
+\item The \texttt{tenant-cli} client: connect to the proxy, read commands from stdin, send them, print responses.
+
+\item The denylist check on incoming queries (reject anything containing \texttt{SET search\_path}, \texttt{SET ROLE}, or a \texttt{tenant\_*.something} pattern).
+\end{itemize}
+
+At the end of Phase 1, one tenant should be able to connect, create tables, insert data, and query them. The results should appear in the correct schema on the backend (verify with a separate \texttt{psql} connection as the admin user: \texttt{SELECT * FROM tenant\_acme.users} should show the acme data). Two tenants connecting simultaneously should each see their own data.
+
+\section{Phase 2 --- Connection Pooling and the Rate Limiter}
+
+The goal of Phase 2 is to move from ``one connection per query'' to a proper pool, and to add the rate limiter.
+
+Build these components:
+
+\begin{itemize}
+\item The per-tenant connection pool (Section 9). Each pool has \texttt{min\_size}, \texttt{initial\_size}, and \texttt{max\_size}. Connections are pre-warmed at startup. Check-out and check-in are protected by a mutex.
+
+\item Integration of the pool into the query path: instead of opening a new connection for each query, take one from the pool, run the query, and return it. Handle the case where the pool is at capacity: block the caller until a connection is available, or (optionally) time out after a few seconds and return an error.
+
+\item The token-bucket rate limiter (Section 8). Each tenant has a bucket, refill rate, and capacity. Queries arriving when the bucket is empty are rejected with the ``retry in Xms'' message.
+
+\item The metering counters from Section 11. Update them on every query, including rejected queries.
+
+\item The \verb|\stats| command that reports all the counters and the current pool state.
+
+\item The \verb|\burst| command in the client, which sends \texttt{N} trivial queries as fast as possible, used to exercise the rate limiter.
+\end{itemize}
+
+At the end of Phase 2, a single tenant should run queries through a pool that is small and stable. A \verb|\burst 100| command with a rate limit of 20/sec should succeed on the first 20 queries and then hit the rate limiter; after a second of waiting, another 20 should succeed. Verify this behavior in your test suite.
+
+\section{Phase 3 --- Multiple Tenants, Isolation Tests, and Benchmark}
+
+The goal of Phase 3 is to bring everything together, verify multi-tenant isolation rigorously, and produce a benchmark.
+
+\subsection{Multi-Tenant Testing}
+Write an isolation test script that:
+
+\begin{enumerate}
+\item Starts the proxy with at least three tenants.
+\item For each tenant, creates a table called \texttt{users} with different columns.
+\item Inserts different data into each.
+\item Verifies that each tenant can only see its own users, and that running \texttt{SELECT count(*) FROM users} on tenant A returns the count of A's users, not the sum of everyone's.
+\item Attempts to escape the schema by running \texttt{SELECT * FROM tenant\_B.users} from tenant A's session. Verifies that the query is rejected with an error.
+\item Attempts to escape via \texttt{SET search\_path = tenant\_B}. Verifies that the query is rejected.
+\item Attempts to escape via \texttt{SET ROLE admin}. Verifies rejection.
+\item Verifies that a query from tenant A that causes a backend error (syntax error, constraint violation) does not affect tenant B's sessions or leave the pool in a bad state.
+\end{enumerate}
+
+\subsection{Rate Limit Fairness Test}
+Write a test that exercises rate limiting across tenants:
+
+\begin{enumerate}
+\item Start the proxy with tenant A (rate 10/sec) and tenant B (rate 50/sec).
+\item From two separate client processes, open sessions for A and B simultaneously.
+\item Have A run a \verb|\burst 200| and B run a \verb|\burst 500| at the same time.
+\item Measure how many of each tenant's queries succeed per second. Verify that A is limited to roughly 10/sec and B is limited to roughly 50/sec, and that A's burst does not affect B's throughput. The two tenants' limits must be independent.
+\end{enumerate}
+
+\subsection{Benchmark}
+Measure three things:
+
+\begin{itemize}
+\item \textbf{Throughput under one tenant}: a single client sending \texttt{SELECT 1} as fast as possible (with the rate limit removed for this test, or configured at a very high value). Report queries per second. Expect several thousand per second at minimum; a well-implemented proxy can hit 10{,}000 to 20{,}000.
+
+\item \textbf{Throughput under many tenants}: start 5 tenants, open 2 sessions per tenant, and have each session send queries at 1/10 of the tenant's rate limit. Report aggregate queries per second and 95th/99th percentile latency.
+
+\item \textbf{Connection pool effectiveness}: run a benchmark where every query opens a new connection (bypass the pool), and compare to a benchmark where the pool is enabled. Report the speedup and the difference in 99th-percentile latency. This quantifies exactly how much work the pool is saving.
+\end{itemize}
+
+The benchmark numbers go in the design document along with a discussion of any surprising results.
+
+\section{Deliverables and Submission}
+
+\subsection{What to Submit}
+A single zip archive containing:
+
+\begin{itemize}
+\item The complete source tree of your implementation, including the proxy (\texttt{tenant-proxy}), the client (\texttt{tenant-cli}), and all test and benchmark scripts.
+
+\item A \texttt{Makefile}, \texttt{CMakeLists.txt}, or \texttt{package.json} that builds (or installs dependencies for) the proxy with a single command on a recent Ubuntu LTS.
+
+\item A \texttt{README.md} with build instructions, instructions for setting up the PostgreSQL backend in each of the deployment options from Section 3, the list of supported client commands, the tenant config file format, and any known limitations.
+
+\item A \texttt{design.pdf} document of at most 12 pages describing: the four-component architecture; the client protocol and the \texttt{HELLO} handshake; the two approaches to schema isolation and why you chose \texttt{SET search\_path} per tenant; the denylist check and its limitations; the token-bucket rate limiter implementation; the per-tenant connection pool with min/max/initial sizing; the metering counters; and a discussion of the isolation tests, the rate limit fairness test, and the benchmark results.
+
+\item A \texttt{tests/} directory containing: the isolation test script from Section 14.1, the rate limit fairness test from Section 14.2, and unit tests for the denylist regex and the token-bucket algorithm.
+
+\item A \texttt{benchmark/} directory with the benchmark scripts and the output of your final run.
+
+\item A \texttt{tenants.conf} example configuration file with at least three tenants.
+
+\item A \texttt{docker-compose.yml} showing how to run the backend PostgreSQL and the proxy together, for the grader's convenience.
+\end{itemize}
+
+\subsection{Archive Naming}
+\texttt{Group[Number]\_Project02\_MultiTenant.zip}, for example \texttt{Group17\_Project02\_MultiTenant.zip}.
+
+\subsection{Demonstration}
+Each group will present a 25-minute live demonstration during the week following the submission deadline. The demonstration consists of three parts. First, a walkthrough of the architecture using the design document. Second, a live startup of a PostgreSQL backend, the proxy, and multiple tenant clients. The instructor will type arbitrary queries in each tenant session, including attempted isolation escapes (``can you run \texttt{SELECT * FROM tenant\_X.users} from tenant Y's session? what happens?''), rate-limit tests, and cross-tenant benchmarks. Third, a short oral examination in which each group member will be asked to explain, without notes, a specific component of the implementation, with particular focus on why \texttt{SET search\_path} on a shared pool is dangerous and how the per-tenant pool design avoids the danger. All group members must be present. Missing the demonstration results in a zero for Phase 3.
+
+\section{Bonus Opportunities}
+
+Each of the following is independent. Bonus credit is awarded on top of the base grade up to a maximum of 15 percentage points. To claim bonus credit, your design document must include a dedicated section explaining which items you attempted and how you verified them.
+
+\subsection{SQL Parser for Safer Rewriting (up to 10\%)}
+Replace the denylist check with actual SQL parsing. Use an existing parser library (for example, \texttt{libpg\_query} from the pganalyze project, which provides PostgreSQL's own parser as a reusable library; or in Node.js, \texttt{node-sql-parser}) to parse the incoming SQL into a syntax tree. Walk the tree to find every table reference. Reject the query if any reference is explicitly schema-qualified; otherwise rewrite the query (or leave it to \texttt{search\_path}) and forward to the backend. Your test suite must include at least 10 tricky test cases that the denylist would incorrectly handle but the parser handles correctly. Describe the parser library you used and why the denylist was insufficient.
+
+\subsection{Dynamic Tenant Management (up to 5\%)}
+Add a small HTTP admin interface (on a separate port, protected by an admin API key) that allows creating and deleting tenants at runtime. Creating a tenant issues the \texttt{CREATE SCHEMA} and initializes a new per-tenant pool and rate limiter. Deleting a tenant closes all sessions, drops the connection pool, and (optionally) drops the schema. The admin API should be minimal: \texttt{POST /tenants}, \texttt{DELETE /tenants/\textit{id}}, \texttt{GET /tenants}.
+
+\subsection{Query Result Streaming (up to 5\%)}
+The base project sends the entire query result as a single response. For large result sets, this is inefficient: the proxy has to buffer the whole result in memory before sending any of it to the client. Implement streaming: as rows arrive from the backend, send them to the client in chunks. The client protocol's response format may need a slight extension to support framing (for example, a length-prefixed chunk format). Measure the memory and latency improvement on a query that returns 100{,}000 rows.
+
+\section{Constraints and Prohibitions}
+
+\begin{notebox}[The Following Will Result in Loss of Credit]
+\begin{itemize}
+\item Use of any existing database proxy or connection pooler as a component of your implementation. This includes but is not limited to PgBouncer, Pgpool-II, Odyssey, HAProxy with database config, Supabase's supavisor, and ProxySQL.
+
+\item Use of any existing multi-tenant SaaS framework or library that provides tenant isolation out of the box.
+
+\item Faking the backend with an in-memory store or a file-backed database. PostgreSQL 14 or later must be running as the real backend; the proxy must speak to it via libpq (or node-postgres in the JavaScript case). This is the one project where an external library is allowed for the backend protocol work.
+
+\item Using approach 1b from Section 7.1 (shared pool with \texttt{SET search\_path} before each query) in the base project. The per-tenant pool approach (1a) is required because it is trivially correct. The shared pool with reset is allowed as part of a bonus only if you can describe the invariants that make it safe.
+
+\item Skipping the denylist check on incoming queries. Without it, any tenant can read any other tenant's data by writing an explicit dotted reference. This is a correctness bug, not a performance issue, and it will be tested.
+
+\item Sharing connection pool state across tenants. Tenant A must not be able to exhaust a pool that tenant B needed; the per-tenant pool isolation must hold.
+
+\item Use of Python at any layer, including tests and benchmarks. Tests and scripts must be written in C, C++, shell, or JavaScript.
+
+\item Submitting code whose commit history shows large, infrequent commits. Your git history should reflect the incremental development of a proxy of this size.
+\end{itemize}
+\end{notebox}
+
+\section{Required Reading}
+
+The first two items are required reading before you begin. The remaining items are reference material.
+
+\begin{enumerate}
+\item PostgreSQL documentation, Chapter 5, Section 5.9 ``Schemas.'' The authoritative reference on how PostgreSQL schemas work and how \texttt{search\_path} affects unqualified name resolution. Read before Phase 1.
+
+\item PostgreSQL documentation, Chapter 32 ``libpq -- C Library.'' The API reference for libpq, which you will use to talk to the backend. Sections 32.1 (database connection control functions) and 32.3 (command execution functions) are the important ones. Read before Phase 1. If you are using Node.js, read the \texttt{node-postgres} documentation at \url{https://node-postgres.com/} instead.
+
+\item Heroku Engineering Blog, ``Multitenant Postgres.'' A practical discussion of the schema-per-tenant pattern from one of the largest SaaS platforms built on top of PostgreSQL. Useful background on why the pattern is used and what its limits are.
+
+\item Kleppmann, M. \textit{Designing Data-Intensive Applications}, Chapter 2 (``Data Models and Query Languages''), section on ``many-to-many relationships'' and the discussion of tenant isolation models. Provides the broader context for the approaches to multi-tenant data.
+
+\item PostgreSQL documentation, Chapter 20 (``Client Authentication''), Sections 20.3 (``Authentication Methods'') and 20.4 (``Trust Authentication''). Background on how a real system would handle the API key problem rather than plain text in a config file.
+
+\item PgBouncer documentation, \url{https://www.pgbouncer.org/usage.html}. PgBouncer is the most popular PostgreSQL connection pooler and its docs describe the different pooling modes (session, transaction, statement). Useful for understanding the tradeoffs you are making with your per-tenant pool design.
+\end{enumerate}
+
+\footerboxes
+\end{document}
