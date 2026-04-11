@@ -1,0 +1,401 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{style_minimal}
+
+\fancyhead[L]{\small\textbf{Project 02}}
+\fancyhead[R]{\small Vector Database Engine}
+\fancyfoot[C]{\small\thepage}
+
+\begin{document}
+
+\projecttitle{Vector Database Engine}{C or C++}
+
+\section{Problem Statement}
+
+You will build a small vector database that stores fixed-dimension vectors of floating-point numbers and answers \textit{nearest-neighbor} queries against them. Given a query vector, the database returns the $k$ stored vectors that are most similar to it. ``Most similar'' is measured by Euclidean distance: the smaller the distance, the more similar the vectors. The result is a network server that listens on a TCP port and a small command-line client that exercises it.
+
+Vector databases are a different kind of database from the relational store you built in Project 01. They do not store rows with named columns; they store points in a high-dimensional space. They do not answer queries like ``which users are from Pakistan;'' they answer queries like ``which 10 stored points are closest to this new point.'' This is the operation that powers image search, music recommendation, semantic text search, and the retrieval step in modern AI systems where text or images have been converted into vector ``embeddings'' by a machine learning model.
+
+The naive way to answer a nearest-neighbor query is to compute the distance from the query to every single stored vector and keep the $k$ smallest. This is correct but slow: with a million stored vectors, every query touches every one of them. A vector database earns its name by going faster than this through clever indexing. The technique you will implement is called the \textit{inverted file index}, or IVF: cluster all the stored vectors into groups using $k$-means, remember each group's center, and at query time only search the few groups whose centers are closest to the query. The result is a query that touches only a small fraction of the stored vectors and is therefore much faster, at the cost of occasionally missing a true nearest neighbor that lives in a group the search did not visit. Your benchmark will measure exactly this tradeoff between speed and accuracy.
+
+You are not building a production vector database. There is no SQL, no schema, no metadata, no filtering, no concurrent updates beyond what is needed to serve multiple clients, no persistence beyond a simple snapshot file, and only one distance function. Your effort goes into four things: representing vectors compactly in memory, computing brute-force nearest neighbors as a correctness baseline, implementing $k$-means and using its output to build the IVF index, and demonstrating the speed/accuracy tradeoff in a benchmark.
+
+\section{What the Final Product Looks Like}
+
+When your project is complete, the server can be started from the command line, and a separate client can add vectors to it and query them back. A session looks like this. The example uses 4-dimensional vectors so the values are short enough to type; the benchmark in Phase 3 uses 64-dimensional vectors loaded from a file.
+
+\begin{codebox}
+\begin{lstlisting}
+$ make
+$ ./vdb --data ./vdata --dim 4 --port 5556
+vdb started on port 5556, dimension 4, data directory ./vdata
+
+[in another terminal]
+$ ./vdb-cli localhost 5556
+connected to vdb at localhost:5556
+
+> ADD 1 0.10 0.20 0.30 0.40
+OK
+> ADD 2 0.15 0.25 0.35 0.45
+OK
+> ADD 3 0.90 0.10 0.10 0.20
+OK
+> ADD 4 0.85 0.15 0.05 0.25
+OK
+> ADD 5 0.50 0.50 0.50 0.50
+OK
+
+> SEARCH 0.12 0.22 0.32 0.42 3 BRUTE
+1  0.04   0.10 0.20 0.30 0.40
+2  0.06   0.15 0.25 0.35 0.45
+5  0.49   0.50 0.50 0.50 0.50
+(3 results, mode=BRUTE, scanned 5)
+
+> BUILD
+Building IVF index...
+  vectors:    5
+  clusters:   2
+  iterations: 4
+  done in 0.001s.
+OK
+
+> SEARCH 0.12 0.22 0.32 0.42 3 IVF 1
+1  0.04   0.10 0.20 0.30 0.40
+2  0.06   0.15 0.25 0.35 0.45
+5  0.49   0.50 0.50 0.50 0.50
+(3 results, mode=IVF, nprobe=1, scanned 3)
+
+> STATS
+dimension:        4
+total vectors:    5
+index built:      yes
+clusters:         2
+cluster sizes:    3, 2
+
+> SAVE
+Saved 5 vectors and IVF index to ./vdata/snapshot.vdb (412 bytes).
+
+> QUIT
+\end{lstlisting}
+\end{codebox}
+
+The interesting line is the second \texttt{SEARCH}. Both queries return the same three vectors (a hand-typed example with only five points is not enough to expose the speed-vs-accuracy tradeoff, but it demonstrates the API). Look at the trailing parenthetical: the brute-force search reported \texttt{scanned 5}, and the IVF search reported \texttt{scanned 3}. With only five vectors and an \texttt{nprobe} of 1, the index visited just one cluster of three vectors instead of all five. The benchmark in Phase 3 (Section 7) will scale this up to 50{,}000 vectors and show speedups of ten times or more, along with recall measurements demonstrating that the IVF index almost always returns the correct answer.
+
+\section{The Wire Protocol}
+
+Communication between client and server is plain text, one command per line, terminated by a newline. The server responds with one or more lines per command. These are the only commands you must support.
+
+\subsection{ADD}
+\begin{codebox}
+\begin{lstlisting}
+ADD id v_1 v_2 v_3 ... v_D
+\end{lstlisting}
+\end{codebox}
+Insert one vector. \texttt{id} is a positive 64-bit integer that the user supplies and that the server uses to refer to this vector in query results. \texttt{v\_1} through \texttt{v\_D} are $D$ floating-point numbers, where $D$ is the dimension the server was started with. A wrong number of components is a protocol violation. Adding a vector with an \texttt{id} that already exists overwrites the previous one. The server responds with \texttt{OK} or an error.
+
+\subsection{SEARCH}
+\begin{codebox}
+\begin{lstlisting}
+SEARCH v_1 v_2 v_3 ... v_D k mode [nprobe]
+\end{lstlisting}
+\end{codebox}
+Return the $k$ stored vectors closest to the query vector. \texttt{mode} is either \texttt{BRUTE} or \texttt{IVF}. In \texttt{BRUTE} mode the server scans every stored vector. In \texttt{IVF} mode, an additional integer \texttt{nprobe} (the number of clusters to visit) follows; the IVF index must already have been built (otherwise the server returns an error). The response is one line per result, in order of increasing distance, formatted as:
+\begin{codebox}
+\begin{lstlisting}
+id   distance   v_1 v_2 ... v_D
+\end{lstlisting}
+\end{codebox}
+followed by a final summary line:
+\begin{codebox}
+\begin{lstlisting}
+(N results, mode=MODE, [nprobe=P, ]scanned S)
+\end{lstlisting}
+\end{codebox}
+where \texttt{S} is the number of vectors actually scanned during the query. This number is the most important diagnostic the system produces, because it directly explains the cost of the query.
+
+\subsection{BUILD}
+\begin{codebox}
+\begin{lstlisting}
+BUILD
+\end{lstlisting}
+\end{codebox}
+Run $k$-means on the currently stored vectors and produce the IVF index. The number of clusters is chosen automatically as $\lfloor\sqrt{N}\rfloor$, where $N$ is the current number of stored vectors; this is the standard rule of thumb for IVF. The response includes the cluster count, the number of $k$-means iterations performed, and the total time taken.
+
+After \texttt{BUILD}, subsequent \texttt{ADD} commands are stored as before, but they are inserted into the existing IVF index by assigning them to the nearest existing cluster (this is described in Section 6.4). They will be visible to both \texttt{BRUTE} and \texttt{IVF} searches. Re-running \texttt{BUILD} reclusters everything from scratch.
+
+\subsection{SAVE and LOAD}
+\begin{codebox}
+\begin{lstlisting}
+SAVE
+LOAD
+\end{lstlisting}
+\end{codebox}
+\texttt{SAVE} writes a snapshot of all stored vectors and the IVF index (if built) to a single binary file in the data directory. \texttt{LOAD} reads it back into the server, replacing the current state. The exact file format is described in Section 6.5. \texttt{LOAD} also runs automatically on server startup if a snapshot file exists.
+
+\subsection{STATS and QUIT}
+\begin{codebox}
+\begin{lstlisting}
+STATS
+QUIT
+\end{lstlisting}
+\end{codebox}
+\texttt{STATS} prints the dimension, total vector count, whether the IVF index has been built, the number of clusters, and the size of each cluster. \texttt{QUIT} disconnects the client; the server keeps running.
+
+\section{Architectural Overview}
+
+The server has three components. Keep them strictly separated.
+
+\begin{codebox}
+\begin{lstlisting}
+           [ TCP connections ]
+                   |
+                   v
+         +---------------------+
+         |  Network layer      |  accept connections, parse
+         |  (Section 4)        |  commands, dispatch, format
+         +---------------------+
+                   |
+                   v
+         +---------------------+
+         |  Vector store       |  flat array of vectors plus
+         |  (Section 5)        |  brute-force search
+         +---------------------+
+                   |
+                   v
+         +---------------------+
+         |  IVF index          |  k-means clustering and
+         |  (Section 6)        |  bucket-based search
+         +---------------------+
+\end{lstlisting}
+\end{codebox}
+
+\section{The Vector Store and Brute-Force Search}
+
+This is the simpler half of the project and the foundation for everything else. The IVF index in Section 6 is built on top of this store, and the brute-force search you implement here will serve as the ground truth for measuring the IVF index's accuracy.
+
+\subsection{Storage Layout}
+The server is started with a fixed dimension $D$. Every stored vector has exactly $D$ components. Store all vectors in a single flat array of \texttt{float} (32-bit) values: vector $i$ occupies positions $i \cdot D$ through $i \cdot D + D - 1$ of the array. In parallel, maintain an array of 64-bit integer ids, where id $i$ corresponds to vector $i$. Use a hash map from external id (the value the user supplied with \texttt{ADD}) to internal index $i$ for fast lookups during overwrite-on-duplicate-id semantics.
+
+This layout has two virtues. First, it is cache-friendly: brute-force search reads vectors sequentially from contiguous memory, which the CPU's hardware prefetcher handles efficiently. Second, it is trivially serializable: the entire vector array can be written to disk as one block of bytes.
+
+In C, allocate the array as \texttt{float* vectors = malloc(N * D * sizeof(float))} and grow it with \texttt{realloc} as more vectors arrive. In C++, \texttt{std::vector<float>} works the same way. Do not store each vector as a separately allocated array; the indirection wastes memory and destroys cache locality.
+
+\subsection{Distance Function}
+The distance between two vectors $a$ and $b$ in this project is squared Euclidean distance:
+\[
+d^2(a, b) = \sum_{i=1}^{D} (a_i - b_i)^2
+\]
+You compute the squared distance, not the actual distance, because the square root is monotonic and unnecessary: if $d^2(a, x) < d^2(a, y)$ then also $d(a, x) < d(a, y)$, so for ranking purposes the square is sufficient. Skipping the square root is faster and slightly more numerically stable. When you print distances in query results, you may print either the squared distance or its square root, but be consistent and document your choice.
+
+The function itself is a tight loop:
+\begin{codebox}
+\begin{lstlisting}
+float distance_sq(const float* a, const float* b, int D) {
+    float sum = 0.0f;
+    for (int i = 0; i < D; i++) {
+        float diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    return sum;
+}
+\end{lstlisting}
+\end{codebox}
+
+This is the function the entire project spends most of its CPU time inside. You may experiment with optimizing it (loop unrolling, compiler intrinsics) as a personal exercise, but the project does not require it. A straightforward implementation is fast enough for the benchmark.
+
+\subsection{Brute-Force k-NN}
+A brute-force $k$-NN search computes the distance from the query to every stored vector and returns the $k$ smallest. The natural data structure for tracking ``the $k$ smallest seen so far'' is a max-heap of size $k$: when a new vector's distance is smaller than the heap's largest element, pop the largest and push the new one. After scanning all vectors, the heap contains the $k$ nearest, in unsorted order; pop them one at a time into a sorted array.
+
+In C++, \texttt{std::priority\_queue} is a max-heap by default and is exactly what you want. In C, write a small heap of fixed size $k$. Both versions are short.
+
+\section{The IVF Index}
+
+This is where the actual vector database lives. The index is built from a complete vector store by clustering all the vectors into groups, and is queried by visiting only the groups whose centers are closest to the query.
+
+\subsection{k-Means Clustering}
+$k$-means is the standard algorithm for partitioning $N$ vectors into $K$ groups such that the total distance from each vector to its group's center is small. It is iterative and very simple. The version you will implement is called Lloyd's algorithm:
+
+\begin{enumerate}
+\item Pick $K$ initial centroids by selecting $K$ vectors at random (without replacement) from the dataset.
+\item For each of the $N$ vectors, find the closest centroid and record its index. This is the \textit{assignment step}.
+\item For each of the $K$ centroids, recompute it as the mean of all vectors that were assigned to it in step 2. This is the \textit{update step}.
+\item If any vector's assignment changed during step 2, go back to step 2. Otherwise, the algorithm has converged.
+\item As a safety measure, cap the loop at 50 iterations even if convergence has not been reached.
+\end{enumerate}
+
+For this project, $K$ is set automatically to $\lfloor\sqrt{N}\rfloor$. With $N = 50{,}000$ vectors, this gives $K = 223$ clusters. With $N = 1{,}000{,}000$, it gives $K = 1{,}000$. The choice of $\sqrt{N}$ is the standard rule of thumb for IVF and gives a good balance between cluster size and cluster count: the work to find the nearest centroid is $O(K) = O(\sqrt N)$, and the work to scan one cluster is on average $O(N/K) = O(\sqrt N)$, so the total query work is $O(\sqrt N)$ in the best case --- a square-root speedup over brute force.
+
+A subtle point: the assignment step is itself a brute-force $k$-NN search where $k = 1$. Reuse your distance function, but do not reuse the heap-based search; for a single nearest neighbor a simple ``best so far'' variable is enough.
+
+Empty clusters are possible: a centroid that ended up far away from every vector may have nothing assigned to it. Handle this by leaving such a centroid in place (the cluster simply remains empty in the resulting index). Do not crash, do not delete the cluster, do not pick a new random centroid.
+
+\subsection{Index Layout}
+After clustering, the IVF index is just two pieces of data:
+
+\begin{itemize}
+\item A flat array of $K$ centroids, each $D$ floats: the cluster centers.
+\item For each cluster, a list of internal indices of the vectors assigned to it. The simplest representation is a \texttt{std::vector<std::vector<int>>} (or in C, an array of $K$ dynamically allocated arrays).
+\end{itemize}
+
+That is the entire index. Notice what is not in the index: the vectors themselves are still stored only in the flat array from Section 5.1. The IVF index references them by integer index. This is intentional and saves a lot of memory.
+
+\subsection{IVF Search}
+A search with the IVF index, given query vector $q$ and parameters $k$ and \texttt{nprobe}, proceeds as follows:
+
+\begin{enumerate}
+\item Compute the squared distance from $q$ to every centroid. There are $K$ centroids, so this is $K$ distance computations.
+\item Pick the \texttt{nprobe} centroids with the smallest distances. (Use a max-heap of size \texttt{nprobe}, exactly the same data structure you used for brute-force $k$-NN.)
+\item For each picked centroid, iterate over the list of vector indices in that cluster. For each one, look up the actual vector in the flat store and compute its distance to $q$. Maintain a max-heap of size $k$ for the running top-$k$ results.
+\item Return the contents of the top-$k$ heap, sorted by distance.
+\end{enumerate}
+
+The number of vectors actually scanned in step 3 is at most $\texttt{nprobe} \cdot \overline{N/K}$ where $\overline{N/K}$ is the average cluster size. Compared to brute force, which scans all $N$ vectors, this is a factor of approximately $K / \texttt{nprobe}$ speedup. With $K = 223$ and $\texttt{nprobe} = 10$, that is a factor of about 22. Increase \texttt{nprobe} for better recall at the cost of speed; decrease it for the opposite.
+
+\subsection{Incremental Insertion}
+After \texttt{BUILD}, new vectors arriving via \texttt{ADD} need to be inserted into the existing index. The simplest correct approach is: compute the distance from the new vector to every existing centroid, find the nearest one, and add the vector's internal index to that cluster's list. Do not move existing vectors; do not recompute centroids. Over time this degrades the index quality slightly because clusters drift away from being optimal, but for the data sizes in this project the degradation is negligible. Re-running \texttt{BUILD} clusters everything from scratch and produces a fresh, optimal index.
+
+\subsection{The Snapshot File Format}
+\texttt{SAVE} produces a single binary file. All integers are little-endian. Floats are stored as IEEE 754 binary32.
+
+\begin{codebox}
+\begin{lstlisting}
+Offset  Size              Field            Description
+------  ----------------  ---------------  ----------------------------
+  0     4                 magic            ASCII bytes 'V','D','B','1'
+  4     4                 version          uint32, must be 1
+  8     4                 dimension (D)    uint32
+ 12     4                 vector_count(N)  uint32
+ 16     4                 cluster_count(K) uint32, 0 if no index
+ 20     N*8               ids              int64[N]
+ ...    N*D*4             vectors          float[N*D]
+ ...    K*D*4             centroids        float[K*D] (omitted if K=0)
+ ...    K*4 + total*4     cluster_lists    for each cluster: uint32 size,
+                                           then size uint32 indices
+\end{lstlisting}
+\end{codebox}
+
+The file is written via the temporary-file-and-rename pattern (write to \texttt{snapshot.vdb.tmp}, then \texttt{rename()} it to \texttt{snapshot.vdb}) so that a crash mid-write cannot leave a half-written file in place. \texttt{LOAD} reads the file in the same order, allocating arrays of the sizes recorded in the header.
+
+\section{Phase Structure}
+
+\subsection{Phase 1 --- Network Layer, Vector Store, and Brute-Force Search}
+
+The goal of Phase 1 is a running TCP server that supports \texttt{ADD}, \texttt{SEARCH} in \texttt{BRUTE} mode, \texttt{STATS}, and \texttt{QUIT}, with all data held in memory and no persistence.
+
+Build these components:
+
+\begin{itemize}
+\item A TCP server that accepts multiple concurrent clients. One thread per client (\texttt{pthread\_create} or \texttt{std::thread}) is the simplest approach; an \texttt{epoll}-based server is acceptable but not required.
+\item A line-based protocol parser that reads one command per line and dispatches to the appropriate handler.
+\item The flat vector store: an array of floats, an array of ids, and a hash map from external id to internal index. Protect the store with a single mutex held during \texttt{ADD} and during the read phase of every search.
+\item The brute-force \texttt{SEARCH} handler: scan the store, maintain a max-heap of size $k$, sort the heap into the result.
+\item The \texttt{STATS} and \texttt{QUIT} handlers.
+\item A simple command-line client (\texttt{vdb-cli}) that opens a TCP connection, reads lines from stdin, sends them to the server, and prints replies.
+\end{itemize}
+
+At the end of Phase 1, the example session in Section 2 should work for everything except \texttt{BUILD}, \texttt{SEARCH IVF}, \texttt{SAVE}, and \texttt{LOAD}. Multiple clients connecting simultaneously must not interfere with each other.
+
+\subsection{Phase 2 --- k-Means and the IVF Index}
+
+The goal of Phase 2 is to build the IVF index and use it to answer queries.
+
+Build these components:
+
+\begin{itemize}
+\item A $k$-means implementation: random initial centroid selection, the assignment-update loop, the convergence check, and the 50-iteration cap.
+\item The IVF index data structure: the centroid array and the per-cluster index lists.
+\item The \texttt{BUILD} command handler that runs $k$-means and produces the index, with timing and iteration count reported in the response.
+\item The \texttt{SEARCH IVF} command handler that uses the index. The output must include the \texttt{scanned} count so the difference between brute force and IVF is visible.
+\item Incremental insertion logic for \texttt{ADD} after \texttt{BUILD}: find the nearest centroid and append to its cluster list.
+\item Updates to \texttt{STATS} to report cluster count and per-cluster sizes.
+\end{itemize}
+
+At the end of Phase 2, the full example session in Section 2 should work except for \texttt{SAVE} and \texttt{LOAD}. To verify correctness, take a small dataset (a few hundred vectors), run a brute-force search and an IVF search with a high \texttt{nprobe} (large enough to visit every cluster), and confirm they return identical results. Then progressively reduce \texttt{nprobe} and observe the results diverging.
+
+\subsection{Phase 3 --- Persistence and Benchmark}
+
+The goal of Phase 3 is to add the snapshot file format and to produce the benchmark report.
+
+Build these components:
+
+\begin{itemize}
+\item The snapshot writer: serialize all vectors and the index according to Section 6.5, using the temp-and-rename pattern.
+\item The snapshot reader: deserialize back into the in-memory structures.
+\item The \texttt{SAVE} and \texttt{LOAD} command handlers, plus automatic \texttt{LOAD} on startup if a snapshot file exists in the data directory.
+\item A benchmark program (a separate binary or a script that drives \texttt{vdb-cli}) that:
+  \begin{itemize}
+  \item Generates 50{,}000 random 64-dimensional vectors. Each component should be drawn from a normal distribution; document the random seed.
+  \item Inserts them all into a freshly started server via \texttt{ADD}. Measure and report wall-clock time and inserts per second.
+  \item Runs \texttt{BUILD}. Report the time taken and the resulting cluster count.
+  \item Generates 100 random query vectors from the same distribution.
+  \item For each query, runs a \texttt{BRUTE} search and an \texttt{IVF} search with \texttt{nprobe} values of 1, 5, 10, and 25. The brute-force results are the ground truth.
+  \item Computes the average wall-clock time per query for each mode and \texttt{nprobe} value.
+  \item Computes the recall@10 for each \texttt{nprobe} value: for each query, the fraction of the 10 brute-force nearest neighbors that also appear in the IVF top 10. Average over the 100 queries.
+  \item Prints a results table with columns: mode, \texttt{nprobe}, average query time (ms), average recall@10, and average vectors scanned per query.
+  \end{itemize}
+\end{itemize}
+
+A successful submission demonstrates the speed/accuracy tradeoff clearly. The IVF index with $\texttt{nprobe} = 1$ should be at least 10x faster than brute force, with recall above 0.5. With $\texttt{nprobe} = 10$, recall should exceed 0.9, while still being several times faster than brute force. The exact numbers depend on the data distribution and the choices you made in clustering, and your design document must include the full results table along with a paragraph explaining the tradeoff your numbers show.
+
+\section{Deliverables and Submission}
+
+\subsection{What to Submit}
+A single zip archive containing:
+
+\begin{itemize}
+\item The complete source tree of your implementation, including both the server (\texttt{vdb}) and the client (\texttt{vdb-cli}).
+\item A \texttt{Makefile} (or \texttt{CMakeLists.txt}) that builds both binaries with a single command on a recent Ubuntu LTS using only the standard C/C++ toolchain.
+\item A \texttt{README.md} explaining how to build and run the project, the list of supported commands, and any known limitations.
+\item A \texttt{design.pdf} document of at most 8 pages describing the three components, the data layout for the vector store and the IVF index, the $k$-means implementation including the cluster count rule, the snapshot file format (essentially repeating Section 6.5 in your own words), the concurrency approach, and a discussion of the benchmark results. The benchmark discussion is the most important section: include the full results table and explain what the recall and timing numbers show about the speed/accuracy tradeoff.
+\item A \texttt{benchmark/} directory with the benchmark program, a script that runs it end to end against a freshly started server, and the results of your final run.
+\item A \texttt{tests/} directory containing simple test cases that exercise the protocol parser, the distance function, the $k$-means implementation (verify it converges on a small handcrafted dataset), and the snapshot reader and writer (round-trip test: save, load, verify everything matches).
+\end{itemize}
+
+\subsection{Archive Naming}
+\texttt{Group[Number]\_Project02\_VectorDB.zip}, for example \texttt{Group17\_Project02\_VectorDB.zip}.
+
+\subsection{Demonstration}
+Each group will present a 20-minute live demonstration during the week following the submission deadline. The demonstration consists of three parts. First, a brief walkthrough of the three components using the design document. Second, a live execution of the benchmark against a freshly built server, with the instructor free to modify the benchmark parameters (number of vectors, dimension, \texttt{nprobe} values) on the spot. Third, a short oral examination in which each group member will be asked to explain, without notes, a specific component of the implementation. All group members must be present. Missing the demonstration results in a zero for Phase 3.
+
+\section{Bonus Opportunities}
+
+Each of the following is independent and may be attempted in any combination. Bonus credit is awarded on top of the base grade up to a maximum of 15 percentage points total. To claim bonus credit, your design document must include a dedicated section explaining which bonus items you attempted and how you verified them.
+
+\subsection{Cosine Similarity (up to 5\%)}
+Add a server-side flag (or \texttt{--metric} command-line option) that switches the distance function to cosine distance: $1 - \frac{a \cdot b}{\|a\|\|b\|}$. The natural way to implement this efficiently is to normalize every vector to unit length on insertion, so that cosine distance reduces to $1 - a \cdot b$, which is computed by a dot-product loop the same length as your existing Euclidean loop. Your benchmark must include a run with cosine distance and a brief discussion of what changes about the recall numbers and why.
+
+\subsection{k-means++ Initialization (up to 5\%)}
+Replace the random initial centroid selection with the $k$-means++ algorithm. The first centroid is chosen uniformly at random; each subsequent centroid is chosen with probability proportional to the squared distance from the nearest already-chosen centroid. This produces dramatically better initial centroids, especially for clustered datasets, and reduces the number of iterations needed for convergence. Report the comparison (iterations and final clustering quality) in your design document.
+
+\subsection{Multi-Probe Refinement (up to 5\%)}
+The IVF query algorithm in Section 6.3 picks the \texttt{nprobe} closest centroids. A more sophisticated approach picks the closest \texttt{nprobe}, scans them, and then conditionally scans additional clusters if the current top-$k$ has not yet stabilized (for example, if the worst result in the top-$k$ heap is still farther from the query than the nearest unvisited centroid). Implement this and demonstrate in your benchmark that it improves recall at the cost of a small increase in scanned-vector count.
+
+\section{Constraints and Prohibitions}
+
+\begin{notebox}[The Following Will Result in Loss of Credit]
+\begin{itemize}
+\item Use of any existing vector search library or its components. This includes but is not limited to FAISS, hnswlib, Annoy, ScaNN, NMSLIB, USearch, Qdrant, Milvus, and their language bindings. Even using such a library only for ``the $k$-means part'' or ``just the index'' is not permitted.
+\item Use of any existing machine learning library that includes a $k$-means implementation. This includes scikit-learn, mlpack, dlib's clustering routines, and their equivalents. You must implement $k$-means yourself.
+\item Use of any existing binary serialization library (Protobuf, Cap'n Proto, FlatBuffers, MessagePack). The snapshot file format is specified in Section 6.5 and must be implemented with direct reads and writes.
+\item Use of text-based storage (JSON, CSV, XML) as the persistent format. The snapshot file must be the binary format described.
+\item Use of Python at any layer of the system, including test harnesses and benchmark drivers. Tests and scripts must be written in C, C++, shell, or JavaScript.
+\item Storing each vector as its own dynamically allocated array (one \texttt{malloc} per vector). The flat-array layout described in Section 5.1 is required.
+\item Submitting code whose commit history shows large, infrequent commits. Your git history should reflect the incremental development of a system of this size; histories with three commits totaling thousands of lines will be scrutinized for academic integrity.
+\end{itemize}
+\end{notebox}
+
+\section{Required Reading}
+
+The first item is short and required reading before you start. The remaining items are reference material to consult during implementation.
+
+\begin{enumerate}
+\item Pinecone, ``Faiss: The Missing Manual'' --- specifically the chapter on ``Inverted File Index.'' A practical, well-illustrated explanation of exactly the index you will build. The article is available freely on Pinecone's documentation site. Read it before Phase 2.
+
+\item Lloyd, S. P. ``Least Squares Quantization in PCM.'' \textit{IEEE Transactions on Information Theory}, 1982. The original paper describing the $k$-means algorithm. The notation is dated but the algorithm is exactly what you will implement; read Section II.
+
+\item Arthur, D. and Vassilvitskii, S. ``k-means++: The Advantages of Careful Seeding.'' \textit{Proceedings of the ACM-SIAM Symposium on Discrete Algorithms}, 2007. Optional. Required reading if you attempt the $k$-means++ bonus. Section 2 is enough.
+
+\item J\'{e}gou, H., Douze, M., and Schmid, C. ``Product Quantization for Nearest Neighbor Search.'' \textit{IEEE Transactions on Pattern Analysis and Machine Intelligence}, 2011. Optional. Background on the more sophisticated indexing techniques (PQ, IVFADC) used by production vector databases. The IVF you are building in this project is the foundation that PQ is built on top of.
+\end{enumerate}
+
+\footerboxes
+\end{document}
