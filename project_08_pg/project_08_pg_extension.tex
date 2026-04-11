@@ -1,0 +1,479 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{style_minimal}
+
+\fancyhead[L]{\small\textbf{Project 02}}
+\fancyhead[R]{\small PostgreSQL Extension in C}
+\fancyfoot[C]{\small\thepage}
+
+\begin{document}
+
+\projecttitle{PostgreSQL Extension in C}{C only}
+
+\section{Problem Statement}
+
+You will write a PostgreSQL extension in C that adds a new data type, operators on that type, utility functions, and an aggregate function to a running PostgreSQL server. The new type is \textit{semantic version}, the dotted-integer format you have already seen in package managers like npm, pip, cargo, and apt: \texttt{1.2.3}, \texttt{2.0.0}, \texttt{0.14.7}. After your extension is installed, a user of \texttt{psql} can declare columns of type \texttt{semver}, insert version strings, sort them correctly, query them with operators like \texttt{>=}, and use built-in aggregate functions like \texttt{MAX} and \texttt{MIN} on them. To PostgreSQL and its users, your type is indistinguishable from a built-in.
+
+This is an unusual project because the code you write does not run as a standalone process. It is compiled as a shared library and loaded by the PostgreSQL server, then invoked by PostgreSQL whenever a query touches your type. Your functions execute inside the database backend process, with access to PostgreSQL's internal memory allocator and value representation. This is how production extensions like PostGIS (which adds geographic types), pgvector (which adds vector similarity search), and \texttt{pg\_stat\_statements} (which tracks query performance) work. You are building a small example of the same thing.
+
+The technical content of the project is twofold. First, you learn the PostgreSQL extension mechanism: the PGXS build system, the conventions for declaring functions in C and registering them in SQL, the rules for memory allocation inside the server, and the special macros used to convert between PostgreSQL's universal value representation (\texttt{Datum}) and ordinary C values. Second, you learn how a database earns the right to be ``extensible'' by exposing a small, well-defined C API that lets third-party code add features without modifying the server itself. Once you understand this, the difference between writing a SQL function (slow, interpreted) and writing a C function (fast, native) becomes clear and useful.
+
+You are not implementing a custom index type, planner hooks, or background workers. Those are advanced features that real extensions sometimes use; they are out of scope here. Your effort goes into four things: getting the build system working, defining the type, writing the functions and operators, and demonstrating it all with a comprehensive SQL test script that doubles as the project's deliverable.
+
+\section{What the Final Product Looks Like}
+
+When your project is complete, a user can clone your repository, run \texttt{make install}, and then use the type from \texttt{psql} like this:
+
+\begin{codebox}
+\begin{lstlisting}
+$ make
+$ sudo make install
+$ psql mydb
+
+mydb=# CREATE EXTENSION semver;
+CREATE EXTENSION
+
+mydb=# SELECT '1.2.3'::semver;
+ semver
+--------
+ 1.2.3
+(1 row)
+
+mydb=# SELECT '1.2.3'::semver < '1.10.0'::semver;
+ ?column?
+----------
+ t
+(1 row)
+
+mydb=# CREATE TABLE packages (
+  name    text PRIMARY KEY,
+  version semver NOT NULL
+);
+CREATE TABLE
+
+mydb=# INSERT INTO packages VALUES
+  ('postgres',    '16.4.0'),
+  ('redis',       '7.2.5'),
+  ('nginx',       '1.27.1'),
+  ('node',        '20.10.0'),
+  ('rust',        '1.81.0');
+INSERT 0 5
+
+mydb=# SELECT * FROM packages WHERE version >= '2.0.0' ORDER BY version DESC;
+   name   | version
+----------+---------
+ postgres | 16.4.0
+ node     | 20.10.0
+ redis    | 7.2.5
+(3 rows)
+
+mydb=# SELECT major(version), minor(version), patch(version) FROM packages
+       WHERE name = 'postgres';
+ major | minor | patch
+-------+-------+-------
+    16 |     4 |     0
+(1 row)
+
+mydb=# SELECT max(version) FROM packages;
+   max
+---------
+ 20.10.0
+(1 row)
+
+mydb=# SELECT name, version, is_compatible(version, '1.0.0'::semver) FROM packages;
+   name   | version | is_compatible
+----------+---------+---------------
+ postgres | 16.4.0  | f
+ redis    | 7.2.5   | f
+ nginx    | 1.27.1  | t
+ node     | 20.10.0 | f
+ rust     | 1.81.0  | t
+(5 rows)
+
+mydb=# SELECT bump_minor('1.2.3'::semver);
+ bump_minor
+------------
+ 1.3.0
+(1 row)
+\end{lstlisting}
+\end{codebox}
+
+The point to notice is that PostgreSQL is using your code to do everything: parsing the literal \texttt{'1.2.3'} into a stored value, comparing two versions for the \texttt{<} operator (and noticing that \texttt{1.10.0} is greater than \texttt{1.2.3}, which a naive string comparison would get wrong), running the \texttt{MAX} aggregate over a column, calling the \texttt{is\_compatible} function on each row, and printing the results. PostgreSQL's planner and executor have no special knowledge of \texttt{semver}; everything works because your extension correctly registered each function and operator with the right signatures.
+
+\section{Prerequisites and Environment Setup}
+
+This project requires a working PostgreSQL development environment. On Ubuntu/Debian:
+
+\begin{codebox}
+\begin{lstlisting}
+sudo apt update
+sudo apt install postgresql postgresql-server-dev-all build-essential
+\end{lstlisting}
+\end{codebox}
+
+The crucial package is \texttt{postgresql-server-dev-all}, which installs the PostgreSQL header files and the \texttt{pg\_config} tool that your \texttt{Makefile} will need. After installation, verify the toolchain works:
+
+\begin{codebox}
+\begin{lstlisting}
+pg_config --includedir-server
+pg_config --pkglibdir
+\end{lstlisting}
+\end{codebox}
+
+Both commands must print valid directory paths. You should also create a database to test in (\texttt{createdb mydb}) and verify you can connect with \texttt{psql mydb}. Do all your development as a regular Linux user; only \texttt{make install} needs \texttt{sudo} (it copies your compiled \texttt{.so} file into PostgreSQL's library directory).
+
+This project is C only. PostgreSQL's internal API is a C API and using C++ introduces compilation complications (name mangling, \texttt{extern "C"} wrapping, exception handling) that are not worth the effort for the small amount of code involved.
+
+\section{PostgreSQL Extension Mechanics}
+
+Before writing any code you need to understand five concepts. None of them is hard, but all of them are different from ordinary C programming, and ignoring them produces extensions that crash the entire PostgreSQL server.
+
+\subsection{The PGXS Build System}
+PostgreSQL ships with a Makefile fragment called PGXS that knows how to compile extension code against the right headers, link the right libraries, and install the result in the right place. Your \texttt{Makefile} is short:
+
+\begin{codebox}
+\begin{lstlisting}
+MODULE_big = semver
+OBJS       = semver.o
+
+EXTENSION = semver
+DATA      = semver--1.0.sql
+REGRESS   = semver_test
+
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+\end{lstlisting}
+\end{codebox}
+
+Run \texttt{make} to compile, \texttt{sudo make install} to install, \texttt{make installcheck} to run the regression tests against an installed copy. PGXS handles every detail of finding the right include paths and the right output directory. You do not need to understand how PGXS works internally; you only need to fill in the four variables at the top.
+
+\subsection{Memory Contexts and palloc}
+PostgreSQL has its own memory allocator. You must use it instead of \texttt{malloc} and \texttt{free} for any memory whose lifetime is tied to the query being executed. The functions are \texttt{palloc(size)} and \texttt{pfree(ptr)}, and they look almost identical to their standard counterparts. The crucial difference is that PostgreSQL groups allocations into \textit{memory contexts}. When a query finishes (or fails with an error), PostgreSQL destroys the per-query memory context, automatically freeing every \texttt{palloc} that was made inside it. You usually do not need to call \texttt{pfree} explicitly.
+
+The rule for this project is: \textbf{always use palloc, never use malloc}. If you slip and use \texttt{malloc}, your extension will leak memory on every query; if you mix \texttt{malloc} and \texttt{pfree} (or vice versa), the server will crash.
+
+\subsection{The Datum Type}
+PostgreSQL passes all values between functions as \texttt{Datum}, a pointer-sized integer that can hold either a small value directly (an integer, a boolean) or a pointer to a larger value (a string, a struct). To get the actual value out of a \texttt{Datum} you use a conversion macro; to put one in you use the inverse macro. The macros are named after the C type they produce or consume:
+
+\begin{codebox}
+\begin{lstlisting}
+int32 x = PG_GETARG_INT32(0);     // get 1st argument as int32
+char *s = PG_GETARG_CSTRING(0);   // get 1st argument as null-terminated C string
+MyType *p = (MyType *) PG_GETARG_POINTER(0); // get 1st arg as pointer to your type
+
+PG_RETURN_INT32(42);              // return an int32
+PG_RETURN_BOOL(true);             // return a boolean
+PG_RETURN_CSTRING(s);             // return a null-terminated C string
+PG_RETURN_POINTER(p);             // return a pointer to your type
+\end{lstlisting}
+\end{codebox}
+
+You do not need to understand how the macros work internally. Treat them as the only legal way to read function arguments and return function results, and follow the pattern.
+
+\subsection{The Function Manager}
+Every C function you want to call from SQL must follow a fixed signature:
+
+\begin{codebox}
+\begin{lstlisting}
+PG_FUNCTION_INFO_V1(my_function);
+
+Datum my_function(PG_FUNCTION_ARGS) {
+    /* read arguments with PG_GETARG_*, return with PG_RETURN_* */
+}
+\end{lstlisting}
+\end{codebox}
+
+The macro \texttt{PG\_FUNCTION\_INFO\_V1(name)} declares your function to PostgreSQL using the modern (``version 1'') calling convention. The function itself takes no explicit arguments; arguments come through the hidden \texttt{PG\_FUNCTION\_ARGS} macro. The function returns \texttt{Datum}; use the \texttt{PG\_RETURN\_}$*$ macros to construct it. Every C function in your extension must follow exactly this signature.
+
+\subsection{The Magic Block}
+Every shared library that PostgreSQL loads as an extension must declare a ``magic block'' so that PostgreSQL can verify the library was compiled against the same version of PostgreSQL that is running. You include exactly one of these in exactly one source file:
+
+\begin{codebox}
+\begin{lstlisting}
+#include "postgres.h"
+#include "fmgr.h"
+
+PG_MODULE_MAGIC;
+\end{lstlisting}
+\end{codebox}
+
+Forget this and the server will refuse to load your extension with an error message about a missing magic block. Include it in two files and you will get a compilation error about a duplicate symbol. Include it in exactly one file.
+
+\section{The semver Type}
+
+The data your type will store is a struct of three 32-bit unsigned integers:
+
+\begin{codebox}
+\begin{lstlisting}
+typedef struct {
+    int32 major;
+    int32 minor;
+    int32 patch;
+} Semver;
+\end{lstlisting}
+\end{codebox}
+
+The text representation is the standard semver format: \texttt{MAJOR.MINOR.PATCH}, where each component is a non-negative decimal integer. \texttt{1.2.3}, \texttt{0.0.1}, \texttt{16.4.0}, and \texttt{20.10.0} are valid; \texttt{1.2}, \texttt{1.2.3.4}, \texttt{v1.2.3}, and \texttt{1.2.x} are not. To keep this project simple, you do not need to support semver pre-release labels (\texttt{1.0.0-rc.1}) or build metadata (\texttt{1.0.0+abc123}); both are part of the full semver specification but introduce comparison rules that are not worth the complexity here. Reject any input string containing a hyphen or a plus sign.
+
+\subsection{Comparison Rules}
+Two semvers are compared field by field, in order: \texttt{major} first, then \texttt{minor} if the majors are equal, then \texttt{patch} if both are equal. Comparison within each field is integer comparison, not string comparison; \texttt{1.10.0} is greater than \texttt{1.9.0}, even though as strings \texttt{"1.10.0"} comes before \texttt{"1.9.0"} lexicographically. This is the entire reason the type exists.
+
+\subsection{Compatibility Rule}
+Two versions are \textit{compatible} (in the sense of the \texttt{is\_compatible} function in the example session) if they share the same \texttt{major} number and the second one's \texttt{minor.patch} is less than or equal to the first one's. This is the same compatibility rule that npm uses for its caret (\texttt{\textasciicircum}) operator: \texttt{1.5.0} is compatible with \texttt{1.4.7} (it has everything 1.4.7 had, plus more), but \texttt{2.0.0} is not compatible with \texttt{1.9.0} (the major version bump signals breaking changes).
+
+\section{Phase 1 --- Build System and Type Registration}
+
+The goal of Phase 1 is a working extension that can be installed and that supports \texttt{CREATE EXTENSION semver}, \texttt{SELECT '1.2.3'::semver}, and storing the type in a table column. No comparisons, no operators, no functions yet --- just the type itself.
+
+Build these components:
+
+\begin{itemize}
+\item The \texttt{Makefile} from Section 4.1, with \texttt{MODULE\_big}, \texttt{OBJS}, \texttt{EXTENSION}, and \texttt{DATA} filled in correctly.
+
+\item A \texttt{semver.control} file containing the metadata PostgreSQL needs to recognize the extension:
+\begin{codebox}
+\begin{lstlisting}
+comment = 'semantic version data type'
+default_version = '1.0'
+relocatable = true
+module_pathname = '$libdir/semver'
+\end{lstlisting}
+\end{codebox}
+
+\item A \texttt{semver--1.0.sql} script that will be run by \texttt{CREATE EXTENSION}. At minimum it must declare the type as a ``shell'' (a placeholder), declare the input and output functions, and then complete the type definition:
+\begin{codebox}
+\begin{lstlisting}
+CREATE TYPE semver;
+
+CREATE FUNCTION semver_in(cstring)
+  RETURNS semver
+  AS 'MODULE_PATHNAME', 'semver_in'
+  LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION semver_out(semver)
+  RETURNS cstring
+  AS 'MODULE_PATHNAME', 'semver_out'
+  LANGUAGE C IMMUTABLE STRICT;
+
+CREATE TYPE semver (
+  INPUT          = semver_in,
+  OUTPUT         = semver_out,
+  INTERNALLENGTH = 12,
+  ALIGNMENT      = int4
+);
+\end{lstlisting}
+\end{codebox}
+
+\item A C source file \texttt{semver.c} containing the magic block, the \texttt{Semver} struct, and two functions:
+\begin{itemize}
+\item \texttt{semver\_in} takes a C string, parses it into a \texttt{Semver} struct (use \texttt{sscanf} or write a small parser by hand), \texttt{palloc}s a struct of size 12 bytes, fills in the three fields, and returns it via \texttt{PG\_RETURN\_POINTER}. If the string does not match the format \texttt{INT.INT.INT} with no extra characters, call \texttt{ereport(ERROR, ...)} to abort with a clear message; PostgreSQL will turn this into a SQL error visible to the client.
+\item \texttt{semver\_out} takes a \texttt{Semver} pointer and produces a C string. Use \texttt{palloc} for the result buffer (32 bytes is more than enough), write the formatted string with \texttt{snprintf}, and return it via \texttt{PG\_RETURN\_CSTRING}.
+\end{itemize}
+\end{itemize}
+
+At the end of Phase 1, this should work end to end:
+
+\begin{codebox}
+\begin{lstlisting}
+$ make && sudo make install
+$ psql mydb
+mydb=# CREATE EXTENSION semver;
+mydb=# SELECT '1.2.3'::semver;
+ semver
+--------
+ 1.2.3
+mydb=# SELECT '1.2.x'::semver;
+ERROR:  invalid input syntax for type semver: "1.2.x"
+mydb=# CREATE TABLE t (v semver);
+mydb=# INSERT INTO t VALUES ('5.6.7'), ('1.2.3');
+mydb=# SELECT * FROM t;
+   v
+-------
+ 5.6.7
+ 1.2.3
+\end{lstlisting}
+\end{codebox}
+
+\section{Phase 2 --- Functions and Operators}
+
+The goal of Phase 2 is to make the type useful: comparisons, operators, and a small collection of utility functions.
+
+\subsection{Comparison Functions}
+Add seven C functions to \texttt{semver.c}: \texttt{semver\_lt}, \texttt{semver\_le}, \texttt{semver\_eq}, \texttt{semver\_ne}, \texttt{semver\_ge}, \texttt{semver\_gt}, and \texttt{semver\_cmp}. The first six return \texttt{bool}; the last returns \texttt{int32} that is negative, zero, or positive depending on the relative order of the two arguments. All seven internally call a single helper function, \texttt{semver\_compare(a, b)}, which does the field-by-field integer comparison described in Section 5.1.
+
+For each comparison function, register it in the SQL script with \texttt{CREATE FUNCTION} (using the same pattern as \texttt{semver\_in}), then create the corresponding operator with \texttt{CREATE OPERATOR}:
+
+\begin{codebox}
+\begin{lstlisting}
+CREATE FUNCTION semver_lt(semver, semver)
+  RETURNS bool
+  AS 'MODULE_PATHNAME', 'semver_lt'
+  LANGUAGE C IMMUTABLE STRICT;
+
+CREATE OPERATOR < (
+  LEFTARG    = semver,
+  RIGHTARG   = semver,
+  PROCEDURE  = semver_lt,
+  COMMUTATOR = >,
+  NEGATOR    = >=
+);
+\end{lstlisting}
+\end{codebox}
+
+The \texttt{COMMUTATOR} and \texttt{NEGATOR} clauses are hints to the query planner: if it knows that \texttt{a < b} can be rewritten as \texttt{b > a} (commutator) or as \texttt{NOT (a >= b)} (negator), it can sometimes simplify queries. Repeat for all six operators (\texttt{<}, \texttt{<=}, \texttt{=}, \texttt{<>}, \texttt{>=}, \texttt{>}).
+
+After this is done, \texttt{ORDER BY} and \texttt{WHERE version > '1.0.0'} both work in \texttt{psql}, because PostgreSQL's planner uses the operators you registered.
+
+\subsection{Utility Functions}
+Add five more C functions and register them in the SQL script:
+
+\begin{itemize}
+\item \texttt{major(semver) returns int} --- return the \texttt{major} field of the input.
+\item \texttt{minor(semver) returns int} --- return the \texttt{minor} field.
+\item \texttt{patch(semver) returns int} --- return the \texttt{patch} field.
+\item \texttt{bump\_minor(semver) returns semver} --- return a new semver with the same \texttt{major}, the \texttt{minor} incremented by 1, and \texttt{patch} reset to 0. Allocate the result with \texttt{palloc}.
+\item \texttt{is\_compatible(semver, semver) returns bool} --- return true if the first argument's \texttt{major} equals the second argument's \texttt{major} and the second argument's (\texttt{minor}, \texttt{patch}) is lexicographically $\leq$ the first's. This implements the npm caret rule from Section 5.2.
+\end{itemize}
+
+These functions exercise everything you have learned: argument extraction, palloc-based result construction, struct field access, and SQL registration.
+
+\subsection{Verifying with EXPLAIN}
+Once the operators are registered, run a query in \texttt{psql} prefixed with \texttt{EXPLAIN}:
+
+\begin{codebox}
+\begin{lstlisting}
+mydb=# EXPLAIN SELECT * FROM packages WHERE version >= '2.0.0';
+\end{lstlisting}
+\end{codebox}
+
+The plan should show a sequential scan with a filter expression that uses your \texttt{semver\_ge} function. This confirms that PostgreSQL's planner found and is using your operator. There is no index on the column (you have not registered an operator class for B-tree, which is intentionally outside the scope of this project), so the scan is sequential. That is fine and expected.
+
+\section{Phase 3 --- Aggregate, Tests, and Demo}
+
+The goal of Phase 3 is to add a custom aggregate, write a comprehensive regression test, and produce a demo SQL file that showcases everything.
+
+\subsection{The MAX Aggregate}
+PostgreSQL's built-in \texttt{MAX} function is itself an aggregate that takes a state-transition function and a comparison. To make \texttt{MAX(semver\_column)} work, you register a state-transition function and then declare an aggregate.
+
+The state-transition function takes the current running maximum and the next value, and returns whichever is larger. In C:
+
+\begin{codebox}
+\begin{lstlisting}
+PG_FUNCTION_INFO_V1(semver_larger);
+Datum semver_larger(PG_FUNCTION_ARGS) {
+    Semver *a = (Semver *) PG_GETARG_POINTER(0);
+    Semver *b = (Semver *) PG_GETARG_POINTER(1);
+    PG_RETURN_POINTER(semver_compare(a, b) >= 0 ? a : b);
+}
+\end{lstlisting}
+\end{codebox}
+
+In SQL:
+
+\begin{codebox}
+\begin{lstlisting}
+CREATE FUNCTION semver_larger(semver, semver)
+  RETURNS semver
+  AS 'MODULE_PATHNAME', 'semver_larger'
+  LANGUAGE C IMMUTABLE STRICT;
+
+CREATE AGGREGATE max(semver) (
+  SFUNC    = semver_larger,
+  STYPE    = semver
+);
+\end{lstlisting}
+\end{codebox}
+
+That is the entire aggregate. The first row's value becomes the initial state. Each subsequent row is fed through the state function. The final state is the result. PostgreSQL handles the loop, the parallelism, and the call to your function.
+
+Repeat the pattern with \texttt{semver\_smaller} and \texttt{CREATE AGGREGATE min(semver)}.
+
+\subsection{Regression Tests}
+PostgreSQL ships with a test framework called \texttt{pg\_regress} that PGXS integrates with automatically. To use it, create two files:
+
+\begin{codebox}
+\begin{lstlisting}
+sql/semver_test.sql       -- a SQL script of test queries
+expected/semver_test.out  -- the exact expected output of those queries
+\end{lstlisting}
+\end{codebox}
+
+\texttt{make installcheck} runs your script against an installed extension and compares the output character-for-character against the expected file. Any difference is a failure. Cover at least:
+
+\begin{itemize}
+\item Basic input and output (\texttt{SELECT '1.2.3'::semver}).
+\item Input rejection for malformed strings (the test should expect the SQL error message your \texttt{ereport} produces).
+\item All six comparison operators with cases that exercise the field-by-field comparison (especially \texttt{1.10.0} vs. \texttt{1.9.0} to verify it is not a string compare).
+\item All five utility functions.
+\item \texttt{ORDER BY} on a column of \texttt{semver}.
+\item \texttt{MAX} and \texttt{MIN} aggregates.
+\item A query that combines several features (e.g., the \texttt{is\_compatible} demo from the example session).
+\end{itemize}
+
+The expected output files take some patience to construct. The recommended workflow is to run your script in \texttt{psql}, copy the output, and clean it up by hand. Once \texttt{make installcheck} passes, leave the expected files alone and treat any future test failure as a real bug to investigate.
+
+\subsection{Demo Script}
+In addition to the regression tests, write a single SQL file \texttt{demo.sql} that loads a realistic dataset (a table of around 20 software packages with versions) and runs the queries from the example session in Section 2. The intent is for a grader to be able to type \texttt{psql mydb -f demo.sql} and see your entire feature set in action in under one screen of output.
+
+\section{Deliverables and Submission}
+
+\subsection{What to Submit}
+A single zip archive containing:
+
+\begin{itemize}
+\item The complete source tree of your extension: \texttt{semver.c}, \texttt{semver.control}, \texttt{semver--1.0.sql}, the \texttt{Makefile}, the \texttt{sql/} and \texttt{expected/} directories, and \texttt{demo.sql}.
+\item A \texttt{README.md} with build instructions, the list of system packages required (including the PostgreSQL development headers), the list of supported types, functions, operators, and aggregates, and any known limitations.
+\item A \texttt{design.pdf} document of at most 8 pages explaining: the structure of the extension (which file does what), the role of the magic block and PGXS, the in-memory representation of the type, the comparison helper, the SQL registration pattern, the regression test strategy, and a brief discussion of one design decision you made (for example, why you used a struct of three int32 fields rather than packing them into a single int64).
+\end{itemize}
+
+\subsection{Archive Naming}
+\texttt{Group[Number]\_Project02\_PGExtension.zip}, for example \texttt{Group17\_Project02\_PGExtension.zip}.
+
+\subsection{Demonstration}
+Each group will present a 20-minute live demonstration during the week following the submission deadline. The demonstration consists of three parts. First, a brief walkthrough of the source layout using the design document. Second, a live build and install of the extension on a clean database, followed by execution of the regression tests and the demo script, with the instructor free to type new queries on the spot. Third, a short oral examination in which each group member will be asked to explain, without notes, a specific component of the implementation: what the magic block does, what the difference between \texttt{palloc} and \texttt{malloc} is, what \texttt{PG\_FUNCTION\_INFO\_V1} accomplishes, or how the SQL planner finds your operators. All group members must be present. Missing the demonstration results in a zero for Phase 3.
+
+\section{Bonus Opportunities}
+
+Each of the following is independent and may be attempted in any combination. Bonus credit is awarded on top of the base grade up to a maximum of 15 percentage points total. To claim bonus credit, your design document must include a dedicated section explaining which bonus items you attempted and how you verified them.
+
+\subsection{B-tree Operator Class for Indexing (up to 10\%)}
+Register a B-tree operator class for \texttt{semver} so that \texttt{CREATE INDEX} works on \texttt{semver} columns. This requires the seven comparison functions (which you already have for the base project) to be assigned to specific ``strategy numbers'' inside an \texttt{OPERATOR CLASS} declaration. The PostgreSQL documentation chapter on ``Interfacing Extensions to Indexes'' describes the strategy numbers for B-tree (1 through 5 for \texttt{<}, \texttt{<=}, \texttt{=}, \texttt{>=}, \texttt{>}) and the support function (\texttt{semver\_cmp}). Your demo must include an \texttt{EXPLAIN} showing that an indexed range query uses an \texttt{Index Scan} rather than a \texttt{Seq Scan}.
+
+\subsection{Pre-release Labels (up to 5\%)}
+Extend the type to support semver pre-release labels (\texttt{1.0.0-alpha}, \texttt{1.0.0-rc.1}). The comparison rules in section 11 of the semver 2.0.0 specification become more complex: a version with a pre-release label is \textit{less} than the same version without one (\texttt{1.0.0-rc.1} $<$ \texttt{1.0.0}), and pre-release labels themselves are compared component by component with mixed numeric and lexical rules. Implement the rules correctly and add regression tests that exercise every case in the specification. Your design document must explain the comparison algorithm in detail.
+
+\subsection{Custom Cast to and from text (up to 5\%)}
+Register an explicit cast between \texttt{text} and \texttt{semver} (\texttt{CREATE CAST (text AS semver)} and \texttt{CREATE CAST (semver AS text)}) so that users can write \texttt{some\_text\_column::semver} naturally. The cast functions are thin wrappers around your existing input and output functions, but the registration is its own learning exercise.
+
+\section{Constraints and Prohibitions}
+
+\begin{notebox}[The Following Will Result in Loss of Credit]
+\begin{itemize}
+\item Use of any existing semver or version-comparison library (\texttt{libsemver}, \texttt{semver4j}, the \texttt{semver} npm package, etc.). All parsing and comparison logic must be written from scratch.
+\item Use of \texttt{malloc}, \texttt{calloc}, \texttt{realloc}, or \texttt{free} for memory whose lifetime spans a PostgreSQL function call. Use \texttt{palloc} and (if necessary) \texttt{pfree}.
+\item Use of any language other than C. C++ is not permitted because it complicates the build and introduces ABI issues with PostgreSQL's C API.
+\item Implementing the type as a SQL function (\texttt{LANGUAGE plpgsql}) instead of a C function. The whole point of the project is the C extension API.
+\item Skipping the regression tests. \texttt{make installcheck} must pass before submission.
+\item Submitting an extension that crashes the PostgreSQL server when used. A crash during grading is a failing grade for Phase 3 regardless of how much else works.
+\item Submitting code whose commit history shows large, infrequent commits. Your git history should reflect the incremental development of an extension of this size; histories with three commits totaling thousands of lines will be scrutinized for academic integrity.
+\end{itemize}
+\end{notebox}
+
+\section{Required Reading}
+
+The first item is required reading before you start. The remaining items are reference material to consult during implementation; they are PostgreSQL's official documentation, which is generally good but is organized as a reference rather than a tutorial.
+
+\begin{enumerate}
+\item Percona Blog, ``Writing PostgreSQL Extensions is Fun -- C Language,'' 2018. The clearest introductory walkthrough of building a simple extension end to end. Read it before Phase 1; the structure of the example matches what you will be doing.
+
+\item PostgreSQL official documentation, chapter ``Extending SQL,'' specifically the sections on user-defined types and user-defined functions in C. The reference for everything in Sections 4 and 5 of this manual.
+
+\item PostgreSQL official documentation, chapter ``Server Programming Interface,'' the section on memory management with \texttt{palloc} and memory contexts. Skim it; you will not need most of it, but the basic rules are essential.
+
+\item PostgreSQL official documentation, chapter ``Interfacing Extensions to Indexes.'' Required reading only if you attempt the B-tree operator class bonus.
+
+\item The source code of \texttt{contrib/citext} in the PostgreSQL source tree (a small extension that adds a case-insensitive text type). It is the closest in spirit and complexity to what you will build, and reading it is the single most useful thing you can do when stuck.
+\end{enumerate}
+
+\footerboxes
+\end{document}
