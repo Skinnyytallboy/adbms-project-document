@@ -1,0 +1,510 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{style_minimal}
+
+\fancyhead[L]{\small\textbf{Project 02}}
+\fancyhead[R]{\small In-Memory Cache Server (Redis Clone)}
+\fancyfoot[C]{\small\thepage}
+
+\begin{document}
+
+\projecttitle{In-Memory Cache Server (Redis Clone)}{C or C++}
+
+\section{Problem Statement}
+
+You will build a small in-memory key-value server that speaks the same wire protocol as Redis, supports the most useful subset of Redis commands, keeps all data in RAM, and persists to disk via periodic snapshots. The result is a network server that existing Redis client libraries can connect to without modification: you can open \texttt{redis-cli}, connect to your server on its chosen port, and run \texttt{SET}, \texttt{GET}, \texttt{LPUSH}, \texttt{INCR}, and the other commands in the supported subset exactly as if you were talking to the real Redis.
+
+Redis is interesting to study because its design is almost the opposite of a traditional relational database. There is no durability for individual writes; there is a single thread doing all the work; there is no query planner, no optimizer, no SQL, and no transactions (in the traditional sense). What Redis does instead is serve requests blindingly fast by keeping everything in memory, avoiding locks through a strictly single-threaded execution model, using hand-tuned in-memory data structures, and pushing persistence to an asynchronous background task. You will build a version of this architecture yourself and see how much of Redis's speed comes not from clever tricks but from the discipline of doing a small number of things well.
+
+The technical content of this project is concentrated in three areas. First, a single-threaded event loop built on \texttt{epoll} (Linux) or \texttt{kqueue} (macOS), handling many concurrent client connections with one thread and no locks. Second, a parser for the Redis wire protocol (RESP), which is a small, elegant, binary-safe text protocol. Third, a collection of in-memory data structures --- strings, lists, hashes, and sorted sets --- each implemented from scratch to support its commands efficiently. You will also add a simple snapshot persistence mechanism, so a server restart does not lose all data.
+
+You are not building every feature of Redis. Clustering, replication, scripting (Lua), modules, and the full list of nearly 300 commands are out of scope. You will implement around 25 carefully chosen commands across the four core data types, which is enough to make the server genuinely useful --- a running instance will work as a cache in front of a web application, a simple message queue, or a leaderboard backend, exactly as real Redis does.
+
+\section{What the Final Product Looks Like}
+
+When your project is complete, you will be able to start the server and connect to it using the real \texttt{redis-cli} tool that comes with any Redis installation on Linux. The fact that an unmodified client talks to your server unmodified is the defining success criterion of the project.
+
+\begin{codebox}
+\begin{lstlisting}
+$ make
+$ ./minired --port 6380 --data ./dump.rdb
+[minired] starting on port 6380
+[minired] no snapshot file found, starting empty
+[minired] event loop ready
+
+# in another terminal, using the real redis-cli
+$ redis-cli -p 6380
+
+127.0.0.1:6380> PING
+PONG
+
+127.0.0.1:6380> SET greeting "hello, world"
+OK
+
+127.0.0.1:6380> GET greeting
+"hello, world"
+
+127.0.0.1:6380> SET counter 0
+OK
+
+127.0.0.1:6380> INCR counter
+(integer) 1
+
+127.0.0.1:6380> INCR counter
+(integer) 2
+
+127.0.0.1:6380> INCRBY counter 10
+(integer) 12
+
+127.0.0.1:6380> LPUSH tasks "wash dishes" "buy bread" "call mom"
+(integer) 3
+
+127.0.0.1:6380> LRANGE tasks 0 -1
+1) "call mom"
+2) "buy bread"
+3) "wash dishes"
+
+127.0.0.1:6380> RPOP tasks
+"wash dishes"
+
+127.0.0.1:6380> HSET user:1 name "Ayesha" age 27 city "Lahore"
+(integer) 3
+
+127.0.0.1:6380> HGET user:1 name
+"Ayesha"
+
+127.0.0.1:6380> HGETALL user:1
+1) "name"
+2) "Ayesha"
+3) "age"
+4) "27"
+5) "city"
+6) "Lahore"
+
+127.0.0.1:6380> ZADD leaderboard 100 "Ali" 85 "Bilal" 92 "Hira"
+(integer) 3
+
+127.0.0.1:6380> ZRANGE leaderboard 0 -1 WITHSCORES
+1) "Bilal"
+2) "85"
+3) "Hira"
+4) "92"
+5) "Ali"
+6) "100"
+
+127.0.0.1:6380> EXPIRE greeting 60
+(integer) 1
+
+127.0.0.1:6380> TTL greeting
+(integer) 58
+
+127.0.0.1:6380> SAVE
+OK
+
+127.0.0.1:6380> DBSIZE
+(integer) 5
+
+127.0.0.1:6380> QUIT
+\end{lstlisting}
+\end{codebox}
+
+The second piece of the final product is that your server keeps working under real load. The benchmark in Phase 3 uses the standard \texttt{redis-benchmark} tool (which also ships with Redis) to fire a large number of concurrent requests at your server and measure throughput and latency. Your implementation must sustain at least 50{,}000 simple operations per second on a modern laptop, which is slower than real Redis but easily within reach of a single-threaded C or C++ implementation that avoids obvious mistakes.
+
+\section{The RESP Protocol}
+
+Everything the client and server exchange is encoded in RESP, the Redis Serialization Protocol. The protocol is deliberately simple and binary-safe. You need to parse it correctly on the input side and emit it correctly on the output side; the rest of the server does not care about it.
+
+\subsection{The Five RESP Types}
+Every value sent over the wire starts with a single byte indicating its type, followed by the value, followed by \verb|\r\n|. The five types are:
+
+\begin{itemize}
+\item \textbf{Simple String}: \texttt{+OK\textbackslash r\textbackslash n}. Used for short, successful status replies.
+\item \textbf{Error}: \texttt{-ERR unknown command\textbackslash r\textbackslash n}. Same format as a simple string but with \texttt{-}; the client treats it as an error.
+\item \textbf{Integer}: \texttt{:1234\textbackslash r\textbackslash n}. A signed 64-bit integer, rendered in ASCII decimal.
+\item \textbf{Bulk String}: \texttt{\$5\textbackslash r\textbackslash nhello\textbackslash r\textbackslash n}. A length-prefixed binary-safe string. The length comes first, then \verb|\r\n|, then exactly that many bytes of data, then another \verb|\r\n|. A bulk string can contain any bytes, including zeros and newlines, because the length is explicit. The special form \texttt{\$-1\textbackslash r\textbackslash n} represents a null value (for example, \texttt{GET} on a non-existent key).
+\item \textbf{Array}: \texttt{*3\textbackslash r\textbackslash n...}. A length-prefixed sequence of other RESP values. The length is the number of elements, each of which is itself a RESP value of any type.
+\end{itemize}
+
+\subsection{How Commands Are Encoded}
+Every command from the client is sent as an array of bulk strings. \texttt{SET greeting hello} is sent as:
+
+\begin{codebox}
+\begin{lstlisting}
+*3\r\n
+$3\r\nSET\r\n
+$8\r\ngreeting\r\n
+$5\r\nhello\r\n
+\end{lstlisting}
+\end{codebox}
+
+(Written here with the \verb|\r\n| explicit for clarity; on the wire they are literal CR LF bytes.) This format is uniform: every command, regardless of name or argument count, is an array of bulk strings. The server's parser only needs to know how to read one RESP array containing bulk strings, and from there it can dispatch on the first element (which is the command name).
+
+\subsection{The Reply}
+Different commands return different RESP types. \texttt{PING} returns a simple string (\texttt{+PONG}). \texttt{GET} returns a bulk string or a null bulk string if the key is missing. \texttt{INCR} returns an integer. \texttt{LRANGE} returns an array of bulk strings. Each command in Section 6 specifies its reply type.
+
+\subsection{Parsing Strategy}
+The parser is a small state machine that reads bytes from the client's input buffer and produces completed RESP values. It must handle partial input gracefully: a TCP \texttt{recv} may return only half a command, and the parser needs to remember its position and continue next time more bytes arrive. Do not try to read a complete command in a single \texttt{recv} call; instead, each client has a read buffer, \texttt{recv} appends to it, and the parser consumes as many complete commands as it can before returning.
+
+This incremental parsing is the single most common source of bugs in the protocol layer. Test it by deliberately chunking input: feed the parser one byte at a time and verify it eventually assembles the same command it would from a single read. Your test suite must include this case.
+
+\section{The Single-Threaded Event Loop}
+
+Redis achieves its performance through a deliberately simple model: one thread handles everything. All network I/O, all command execution, all data structure manipulation, all persistence triggering --- everything happens on a single thread driven by an event loop. There are no locks because there is nothing to lock: only one piece of code is running at any moment.
+
+\subsection{Why Single-Threaded}
+If you have built a multi-threaded server before, the idea of running everything on one thread may sound like a performance disaster. It is not, for two reasons. First, most of the time a server is not doing CPU work; it is waiting for I/O. A single thread can handle thousands of simultaneous connections as long as it never blocks waiting on any one of them. Second, locking has its own cost: cache line ping-pong between cores, contention on hot data structures, lock-ordering bugs. Removing locks entirely is faster than using fast locks.
+
+The discipline required to make this work is that no handler function may block. Every operation the server performs on a client connection --- reading a request, executing the command, writing the reply --- must either complete immediately or be broken up so that control returns to the event loop and other clients can be serviced. For this project, the only operations that could possibly block are network reads and writes (handled by making the sockets non-blocking) and disk I/O (handled by doing the snapshot in a forked child process; see Section 7).
+
+\subsection{epoll and kqueue}
+On Linux, the kernel interface for ``tell me when any of these file descriptors has I/O to do'' is \texttt{epoll}. On macOS and BSD, it is \texttt{kqueue}. The two APIs are very similar in shape and functionality; write a thin abstraction that exposes whichever one your build target provides. On Linux, the three calls you need are:
+
+\begin{codebox}
+\begin{lstlisting}
+int epfd = epoll_create1(0);
+
+struct epoll_event ev;
+ev.events = EPOLLIN;
+ev.data.fd = client_fd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
+
+struct epoll_event events[MAX_EVENTS];
+int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+for (int i = 0; i < n; i++) {
+    // events[i].data.fd is ready to read or write
+}
+\end{lstlisting}
+\end{codebox}
+
+\subsection{Non-Blocking Sockets}
+Every socket --- the listening socket and every client connection --- must be set to non-blocking mode using \texttt{fcntl(fd, F\_SETFL, O\_NONBLOCK)}. This means \texttt{recv} and \texttt{send} return immediately: if there is no data to read, \texttt{recv} returns $-1$ with \texttt{errno == EAGAIN} (or \texttt{EWOULDBLOCK}, which is the same thing on Linux). If the send buffer is full, \texttt{send} returns $-1$ with the same error. The event loop handles these signals by noting the condition and continuing; when the socket becomes ready again, \texttt{epoll} reports it.
+
+\subsection{Per-Client Buffers}
+Each connected client has two buffers: an input buffer for bytes read from the socket and not yet parsed, and an output buffer for bytes to be written to the socket that the kernel has not yet accepted. The event loop's job for each client is roughly:
+
+\begin{enumerate}
+\item If the client's socket is readable, \texttt{recv} into the input buffer; run the RESP parser on the buffer; for each complete command, dispatch it to its handler, which appends the reply to the output buffer.
+\item If the client's socket is writable and the output buffer is non-empty, \texttt{send} from the output buffer and advance the buffer's start pointer by however many bytes were accepted.
+\item If a read or write returns 0 or a fatal error, close the connection and release the buffers.
+\end{enumerate}
+
+The event loop dynamically tracks which clients have pending output. When a client's output buffer is empty, the event loop only watches for readable events (\texttt{EPOLLIN}); when a client has pending output, the event loop also watches for writable events (\texttt{EPOLLIN | EPOLLOUT}). Using \texttt{EPOLLOUT} unconditionally wastes CPU because the socket is almost always writable.
+
+\section{The Data Types}
+
+You will implement four data types. Each is a C struct (or a tagged union) that owns its representation and exposes a small API used by the command handlers.
+
+\subsection{The Top-Level Dictionary}
+The keyspace is a single hash table mapping string keys to \textit{values}, where a value is a tagged union of the four data types plus string. In C:
+
+\begin{codebox}
+\begin{lstlisting}
+typedef enum {
+    OBJ_STRING,
+    OBJ_LIST,
+    OBJ_HASH,
+    OBJ_ZSET
+} ObjType;
+
+typedef struct {
+    ObjType type;
+    union {
+        sds           str;     // for OBJ_STRING
+        List         *list;    // for OBJ_LIST
+        HashTable    *hash;    // for OBJ_HASH
+        SortedSet    *zset;    // for OBJ_ZSET
+    } ptr;
+    int64_t expire_at_ms;      // 0 = no expiration
+} Obj;
+
+typedef struct {
+    /* hash table mapping sds keys to Obj values */
+} Dict;
+\end{lstlisting}
+\end{codebox}
+
+The dictionary grows as items are added. A simple linear-probing or chaining hash table is fine; incremental rehashing in the Redis style is a bonus. The dictionary is the single top-level data structure of your server and is accessed on essentially every command.
+
+\subsection{Strings (sds)}
+Redis strings are binary-safe: they can contain any bytes, including zeros. The standard C \texttt{char*} is insufficient because it assumes null termination. Implement a simple string type called \texttt{sds} (``simple dynamic string,'' the same name Redis uses) that stores a length alongside the bytes:
+
+\begin{codebox}
+\begin{lstlisting}
+typedef struct {
+    size_t len;
+    size_t cap;
+    char data[];  // flexible array member, len bytes of actual data
+} sds_header;
+
+typedef char* sds;  // pointer to the data field of an sds_header
+\end{lstlisting}
+\end{codebox}
+
+The trick in Redis is that \texttt{sds} is typedef'd to \texttt{char*}, but the pointer actually points to the \texttt{data} field of the header, with the length and capacity stored in the bytes immediately before. This means an \texttt{sds} can be passed to functions expecting \texttt{const char*} (they work, assuming no embedded nulls) while still allowing length queries via \texttt{sds\_len(s)} which reads backward from the pointer. Implement this trick; it is elegant and it demonstrates why people love C.
+
+If you find the negative-offset trick confusing, a simpler alternative is to represent \texttt{sds} as a plain struct pointer with explicit \texttt{s->data} access everywhere. Both are acceptable; document whichever choice you make.
+
+\subsection{Lists}
+Implement lists as doubly-linked lists of \texttt{sds} values. Each node is a struct with a pointer to the previous node, a pointer to the next node, and the value. The list struct holds head and tail pointers and a length counter.
+
+All list commands (\texttt{LPUSH}, \texttt{RPUSH}, \texttt{LPOP}, \texttt{RPOP}, \texttt{LLEN}, \texttt{LRANGE}, \texttt{LINDEX}) are straightforward walks of this structure. \texttt{LRANGE} with negative indices (like \texttt{LRANGE key 0 -1} to get the whole list) requires normalizing the indices first: negative values count backward from the tail, so $-1$ is the last element and $-2$ is the second-to-last.
+
+You do not need to implement the ziplist optimization (Redis's compact representation for small lists). A plain doubly-linked list is sufficient.
+
+\subsection{Hashes}
+A hash (sometimes called a ``hash map'' to disambiguate from the top-level dictionary) is a mapping from string fields to string values, stored under a single top-level key. Implement it as another instance of your dictionary data structure, with the same hash table code. Redis itself has a special compact representation for small hashes (``listpack''); you do not need to replicate this.
+
+Hash commands (\texttt{HSET}, \texttt{HGET}, \texttt{HDEL}, \texttt{HEXISTS}, \texttt{HLEN}, \texttt{HKEYS}, \texttt{HVALS}, \texttt{HGETALL}) are all simple wrappers around dictionary operations.
+
+\subsection{Sorted Sets}
+A sorted set is a collection of (member, score) pairs, where members are strings and scores are doubles, and the set is kept ordered by score. Commands include \texttt{ZADD} (insert or update), \texttt{ZSCORE} (lookup by member), \texttt{ZRANGE} (retrieve a range by rank order), \texttt{ZRANGEBYSCORE} (retrieve by score range), \texttt{ZRANK} (position of a member), and \texttt{ZCARD} (size).
+
+Redis implements sorted sets as a pair of structures: a hash table from member to score (for $O(1)$ score lookup) and a skip list keyed by score (for $O(\log n)$ ordered traversal). Implement the same combination. The skip list is the one non-trivial data structure in this project; see Section 5.5.
+
+\subsection{Skip Lists}
+A skip list is a probabilistic alternative to a balanced tree that is much easier to implement correctly. It is a sorted linked list with additional forward pointers at multiple ``levels'': each node has some random number of forward pointers, with higher-level pointers skipping further ahead. Search starts at the highest level and descends: walk forward at the current level until the next node would overshoot the target, then drop down one level and continue. Insert and delete do the same traversal and then fix up the pointers.
+
+The key property of a skip list is that the expected time for search, insert, and delete is $O(\log n)$, matching a balanced tree, but the code is drastically simpler. A basic skip list implementation is around 200 lines of C.
+
+The level of a new node is chosen randomly: with probability $p = 1/2$, the node has at least one level; with probability $p^2$, it has at least two; and so on. A reasonable maximum level is 32, which supports up to $2^{32}$ elements comfortably. On insert, generate a random level for the new node, allocate forward pointers for that many levels, and insert the node into the list at each of those levels.
+
+Pugh's original 1990 paper (``Skip Lists: A Probabilistic Alternative to Balanced Trees,'' Communications of the ACM) is short, readable, and contains pseudocode for insert, search, and delete. It is the recommended reference. The paper is in the Required Reading list at the end of this manual.
+
+\section{The Command Set}
+
+You will implement approximately 25 commands. They are listed below, grouped by the data type they operate on. For each command, the semantics are exactly what the Redis documentation at \url{https://redis.io/commands/} describes; you should open that documentation and cross-reference as you implement each one. The correctness bar is ``identical observable behavior to real Redis for the inputs in the test suite,'' not ``close enough.''
+
+\subsection{Connection and Server}
+\texttt{PING}, \texttt{ECHO}, \texttt{QUIT}, \texttt{SELECT} (accept but ignore, as this project has only one database), \texttt{DBSIZE}, \texttt{FLUSHDB}.
+
+\subsection{Generic Key Operations}
+\texttt{DEL}, \texttt{EXISTS}, \texttt{TYPE}, \texttt{EXPIRE}, \texttt{TTL}, \texttt{PERSIST}, \texttt{KEYS pattern}.
+
+\texttt{EXPIRE} sets a time-to-live on a key; after the TTL elapses, the key is automatically deleted. Implement expiration lazily: every time a command reads or writes a key, check whether the key has expired and delete it on the spot if so. A background active-expiration sweep is a bonus, not a requirement.
+
+\texttt{KEYS pattern} returns all keys matching a glob pattern. Support \texttt{*} (zero or more characters), \texttt{?} (exactly one character), and literal characters. A simple recursive match function is sufficient; full glob support with character classes is out of scope.
+
+\subsection{String Operations}
+\texttt{SET}, \texttt{GET}, \texttt{SETNX}, \texttt{APPEND}, \texttt{STRLEN}, \texttt{INCR}, \texttt{INCRBY}, \texttt{DECR}, \texttt{DECRBY}.
+
+\texttt{INCR} and friends must parse the current value as an integer, increment it, and write the result back. If the key does not exist, treat it as 0. If the key exists but its value is not a valid integer string, return an error.
+
+\subsection{List Operations}
+\texttt{LPUSH}, \texttt{RPUSH}, \texttt{LPOP}, \texttt{RPOP}, \texttt{LLEN}, \texttt{LRANGE}, \texttt{LINDEX}.
+
+\subsection{Hash Operations}
+\texttt{HSET}, \texttt{HGET}, \texttt{HDEL}, \texttt{HEXISTS}, \texttt{HLEN}, \texttt{HKEYS}, \texttt{HVALS}, \texttt{HGETALL}.
+
+\subsection{Sorted Set Operations}
+\texttt{ZADD}, \texttt{ZSCORE}, \texttt{ZRANGE} (with optional \texttt{WITHSCORES}), \texttt{ZRANK}, \texttt{ZCARD}, \texttt{ZREM}.
+
+\section{Persistence: Snapshots}
+
+Without persistence, every restart loses all data. Implement a simple snapshot mechanism based on forking.
+
+\subsection{The Snapshot Format}
+A snapshot file is a single binary file containing every key and value currently in the dictionary. Use the following format:
+
+\begin{codebox}
+\begin{lstlisting}
+Offset  Size   Field           Description
+------  -----  --------------  --------------------------------------
+  0      4     magic           ASCII bytes 'M','R','D','B'
+  4      4     version         uint32, must be 1
+  8      8     key_count        uint64, number of top-level keys
+
+For each key, in any order:
+  1      type            uint8 (0=string, 1=list, 2=hash, 3=zset)
+  8      expire_at_ms    int64 (0 if no expiration)
+  4      key_len         uint32
+  var    key bytes
+  var    type-specific body (described below)
+\end{lstlisting}
+\end{codebox}
+
+Type-specific bodies:
+
+\begin{itemize}
+\item \textbf{String}: 4-byte length followed by the bytes.
+\item \textbf{List}: 4-byte element count followed by, for each element, a 4-byte length plus its bytes.
+\item \textbf{Hash}: 4-byte entry count followed by, for each entry, a 4-byte field length, the field bytes, a 4-byte value length, and the value bytes.
+\item \textbf{Sorted set}: 4-byte entry count followed by, for each entry, an 8-byte score (as IEEE 754 double in native byte order), a 4-byte member length, and the member bytes.
+\end{itemize}
+
+At the end of the file, append an 8-byte CRC64 of everything written so far. On load, verify the CRC before using any of the data.
+
+\subsection{Writing the Snapshot with fork}
+Here is the elegant trick that makes Redis's snapshotting work without blocking the event loop. When the user issues the \texttt{SAVE} command (or the server decides to snapshot automatically), the server calls \texttt{fork()}. The child process inherits a copy-on-write snapshot of the parent's memory at the moment of the fork. The child's job is simple: write every key in its (frozen) copy of the dictionary to a temporary file, \texttt{rename()} it into place, and exit. The parent continues running the event loop normally while the child writes; any writes the parent makes during this time modify pages that are copied on write, leaving the child's view untouched.
+
+In practice this means the \texttt{SAVE} command handler:
+
+\begin{enumerate}
+\item Calls \texttt{fork()}.
+\item If the return value is 0, you are in the child: iterate the dictionary, serialize to \texttt{dump.rdb.tmp}, \texttt{fsync}, \texttt{rename()} to \texttt{dump.rdb}, exit 0.
+\item If the return value is positive, you are in the parent: note the child's pid so that a future \texttt{SIGCHLD} handler can reap it, and reply \texttt{OK} to the client immediately.
+\item If the return value is negative, fork failed; reply with an error.
+\end{enumerate}
+
+This is one of the few places in the project where you will use an OS primitive (\texttt{fork}) that does something genuinely unusual. Take a moment to understand copy-on-write before implementing it; the \texttt{fork(2)} manual page and any Linux systems programming textbook will explain it adequately.
+
+\subsection{Loading on Startup}
+On startup, check whether the snapshot file exists. If so, read it, verify the magic and version, rebuild the in-memory dictionary by deserializing every entry, verify the CRC at the end, and report the load result. If the CRC does not match, or if any record's length is inconsistent with the file, abort startup with an error; do not try to recover partial data.
+
+\section{Phase 1 --- Event Loop, RESP, and Strings}
+
+The goal of Phase 1 is a working server that accepts concurrent clients, parses RESP correctly, and implements enough commands to be tested with \texttt{redis-cli}: \texttt{PING}, \texttt{ECHO}, \texttt{SET}, \texttt{GET}, \texttt{DEL}, \texttt{EXISTS}, \texttt{DBSIZE}, \texttt{QUIT}. Only the string data type is implemented. No persistence, no expiration, no other commands.
+
+Build these components:
+
+\begin{itemize}
+\item The \texttt{sds} dynamic string type, with constructors, length, append, and free.
+
+\item The top-level dictionary as a hash table from \texttt{sds} key to a tagged value. For Phase 1, the only tagged value type is \texttt{OBJ\_STRING}.
+
+\item The \texttt{epoll} (or \texttt{kqueue}) event loop with non-blocking sockets. The listening socket is registered on startup; each accepted client is added to the loop.
+
+\item Per-client input and output buffers; \texttt{EPOLLIN} is always watched, \texttt{EPOLLOUT} is only watched when the output buffer is non-empty.
+
+\item A complete RESP parser that handles incremental input. Unit test it by feeding single bytes.
+
+\item A complete RESP writer that produces each of the five reply types.
+
+\item The command dispatch: given a parsed command (an array of bulk strings), look up the first element in a command table, and call the handler with the remaining arguments.
+
+\item Handlers for \texttt{PING}, \texttt{ECHO}, \texttt{SET}, \texttt{GET}, \texttt{DEL}, \texttt{EXISTS}, \texttt{DBSIZE}, \texttt{QUIT}.
+\end{itemize}
+
+At the end of Phase 1, \texttt{redis-cli -p 6380} must work for all eight commands. Run \texttt{redis-benchmark -p 6380 -t set,get} and verify that it completes without errors; report the observed throughput.
+
+\section{Phase 2 --- Full Command Set and Expiration}
+
+The goal of Phase 2 is to implement all remaining commands (Section 6) and the TTL mechanism.
+
+Build these components:
+
+\begin{itemize}
+\item The list, hash, and sorted set data types (Sections 5.3, 5.4, 5.5). The skip list is the only non-trivial component; budget a full day for it alone and test it in isolation before wiring it up.
+
+\item All commands listed in Section 6 that were not already done in Phase 1.
+
+\item Lazy expiration: before reading or writing any key, check \texttt{expire\_at\_ms} against the current time and delete the key if expired.
+
+\item The \texttt{EXPIRE}, \texttt{TTL}, and \texttt{PERSIST} commands.
+
+\item The \texttt{KEYS pattern} command with a glob-style matcher.
+
+\item The \texttt{TYPE} command, which inspects the tagged value and returns the type name.
+\end{itemize}
+
+At the end of Phase 2, the example session in Section 2 should work end to end (except for \texttt{SAVE}, which is Phase 3). Every command in Section 6 must produce the same observable result as real Redis for reasonable inputs.
+
+\section{Phase 3 --- Persistence and Benchmark}
+
+The goal of Phase 3 is the snapshot mechanism and the benchmark.
+
+\subsection{Snapshots}
+Implement the snapshot writer and reader per Section 7, using \texttt{fork()} as described. Add the \texttt{SAVE} command (synchronous: wait for the child to finish before replying) and the \texttt{BGSAVE} command (asynchronous: reply immediately and let the child write in the background). Add automatic snapshot loading on startup.
+
+\subsection{Benchmark}
+Use the real \texttt{redis-benchmark} tool (which ships with any Redis installation: \texttt{sudo apt install redis-tools}). The benchmark will open many concurrent connections to your server and fire a large number of commands through each.
+
+Run the benchmark in at least these configurations and record the results:
+
+\begin{itemize}
+\item \texttt{redis-benchmark -p 6380 -t ping -n 100000} --- baseline throughput with the simplest possible command.
+\item \texttt{redis-benchmark -p 6380 -t set,get -n 100000 -r 10000} --- string operations with 10{,}000 distinct keys.
+\item \texttt{redis-benchmark -p 6380 -t lpush,lpop -n 50000} --- list operations.
+\item \texttt{redis-benchmark -p 6380 -t hset -n 50000} --- hash operations.
+\item \texttt{redis-benchmark -p 6380 -t zadd -n 50000} --- sorted set operations. This exercises the skip list.
+\end{itemize}
+
+For each run, record the throughput in operations per second and the 50th / 95th / 99th percentile latencies (which \texttt{redis-benchmark} prints by default). Include these numbers in your design document along with a brief analysis of which commands are fastest, which are slowest, and why.
+
+A successful submission sustains at least 50{,}000 operations per second on \texttt{SET}/\texttt{GET}, which is a safe target for a single-threaded implementation on a modern laptop. If your numbers are significantly lower, spend time profiling before submitting: the usual culprits are unnecessary allocations in the hot path, excessive copying of buffers, and calling \texttt{recv}/\texttt{send} too many times with tiny sizes.
+
+\subsection{Persistence Correctness Test}
+In addition to the performance benchmark, add a persistence correctness test:
+
+\begin{enumerate}
+\item Start the server with an empty data directory.
+\item Insert 10{,}000 key-value pairs of each data type (strings, lists, hashes, sorted sets).
+\item Call \texttt{SAVE}.
+\item Shut down the server.
+\item Restart the server pointing at the same data directory.
+\item Verify that every inserted key is present and has the same value it had before shutdown.
+\end{enumerate}
+
+This test protects against bugs in the snapshot format and in the load path. A regression in either of them is immediately visible.
+
+\section{Deliverables and Submission}
+
+\subsection{What to Submit}
+A single zip archive containing:
+
+\begin{itemize}
+\item The complete source tree of your implementation.
+\item A \texttt{Makefile} (or \texttt{CMakeLists.txt}) that builds the \texttt{minired} binary with a single command on a recent Ubuntu LTS.
+\item A \texttt{README.md} with build instructions, a list of implemented commands, instructions for connecting with \texttt{redis-cli}, and any known limitations.
+\item A \texttt{design.pdf} document of at most 10 pages explaining: the event-loop architecture, the RESP parser's incremental-input handling, the top-level dictionary, each of the four data type implementations (especially the skip list), the snapshot format, the \texttt{fork}-based persistence, the lazy-expiration mechanism, and a discussion of the benchmark results with your throughput numbers and latency percentiles.
+\item A \texttt{benchmark/} directory with the shell script that runs the \texttt{redis-benchmark} suite against a freshly started server and the output of your final run.
+\item A \texttt{tests/} directory with tests covering: the RESP parser (especially partial-input cases), the \texttt{sds} string type, each data type in isolation, the skip list in isolation, the snapshot round-trip (save, reload, verify), and the TTL / expiration behavior.
+\end{itemize}
+
+\subsection{Archive Naming}
+\texttt{Group[Number]\_Project02\_Redis.zip}, for example \texttt{Group17\_Project02\_Redis.zip}.
+
+\subsection{Demonstration}
+Each group will present a 20-minute live demonstration during the week following the submission deadline. The demonstration consists of three parts. First, a brief walkthrough of the architecture using the design document. Second, a live connection using \texttt{redis-cli} with the instructor free to type commands on the spot and observe the server's behavior, followed by running the benchmark against a freshly compiled server. Third, a short oral examination in which each group member will be asked to explain, without notes, a specific component of the implementation, with particular focus on the event loop's non-blocking discipline and the \texttt{fork}-based snapshot trick. All group members must be present. Missing the demonstration results in a zero for Phase 3.
+
+\section{Bonus Opportunities}
+
+Each of the following is independent. Bonus credit is awarded on top of the base grade up to a maximum of 15 percentage points. To claim bonus credit, your design document must include a dedicated section explaining which items you attempted and how you verified them.
+
+\subsection{AOF Persistence (up to 5\%)}
+In addition to snapshots, implement Append-Only File persistence: every write command is appended to a log file (in RESP format, as if the client had sent it). On startup, the server replays the log by running each command as if a client had sent it, producing the exact same state as before shutdown. Support the three \texttt{fsync} policies Redis offers: \texttt{always} (fsync after every command, safest), \texttt{everysec} (fsync once per second, the Redis default), and \texttt{no} (never fsync explicitly, fastest). Benchmark the tradeoff.
+
+\subsection{Pub/Sub (up to 5\%)}
+Implement the Redis publish/subscribe mechanism. Commands: \texttt{SUBSCRIBE channel}, \texttt{UNSUBSCRIBE}, \texttt{PUBLISH channel message}. When a client is subscribed to one or more channels, a \texttt{PUBLISH} on one of those channels causes the server to push the message to every subscribed client. Subscribed clients cannot issue other commands until they unsubscribe. Verify the behavior with two \texttt{redis-cli} instances: one subscribed, one publishing.
+
+\subsection{Active Expiration Sweep (up to 5\%)}
+The base project uses lazy expiration, which leaves expired keys sitting in memory until the next time they happen to be accessed. Add a background sweep that runs once per second and actively expires a sample of keys, mirroring the Redis behavior described in its \texttt{expires.c} source file. The trick is to keep the sweep bounded in cost so it does not block the event loop for too long. Describe your sampling strategy in the design document.
+
+\section{Constraints and Prohibitions}
+
+\begin{notebox}[The Following Will Result in Loss of Credit]
+\begin{itemize}
+\item Use of Redis itself, or any embeddable cache library (hiredis, memcached, KeyDB, Dragonfly, Valkey) as a component of your server. The point of the project is to build the server yourself.
+
+\item Use of any existing RESP parser or serializer library. Write your own.
+
+\item Use of any existing data structure library that provides skip lists, sorted maps, or priority queues (GLib, Abseil, folly, etc.) for the sorted set implementation. The skip list in particular must be your own code.
+
+\item Use of a multithreaded architecture with locks for the command execution path. Redis is single-threaded by design and this project follows suit. Background workers for snapshotting via \texttt{fork} are fine; threads sharing the dictionary are not.
+
+\item Use of text-based storage (JSON, CSV, XML) as the snapshot format. The snapshot must be the binary format described in Section 7.
+
+\item Use of \texttt{select} or \texttt{poll} instead of \texttt{epoll} or \texttt{kqueue} for the event loop. \texttt{select} has a hard limit of 1024 file descriptors; \texttt{poll} is linear in the total number of clients. \texttt{epoll}/\texttt{kqueue} are the modern, scalable APIs and are what Redis itself uses.
+
+\item Use of Python at any layer, including test harnesses. Tests and benchmarks must be written in C, C++, shell, or JavaScript.
+
+\item Submitting code whose commit history shows large, infrequent commits. The incremental nature of a server of this size should be visible in your git log.
+\end{itemize}
+\end{notebox}
+
+\section{Required Reading}
+
+The first two items are short and required reading before you start. The remaining items are reference material to consult during implementation.
+
+\begin{enumerate}
+\item Redis documentation, ``Redis protocol specification'' at \url{https://redis.io/docs/reference/protocol-spec/}. The complete RESP specification in a few pages. Read it before Phase 1.
+
+\item Pugh, W. ``Skip Lists: A Probabilistic Alternative to Balanced Trees.'' \textit{Communications of the ACM}, 33(6):668--676, 1990. The original skip list paper. Short, readable, contains pseudocode. Read it before Phase 2.
+
+\item Carlson, J. L. \textit{Redis in Action}, Manning, 2013. A practical book covering Redis from a user's perspective. Useful for understanding what commands are supposed to do and why the data types are designed the way they are. Chapter 2 is particularly relevant.
+
+\item The Redis source code, specifically the files \texttt{src/networking.c} (for the event loop and client management), \texttt{src/sds.c} (for the \texttt{sds} type), \texttt{src/t\_zset.c} (for the sorted set and skip list), and \texttt{src/rdb.c} (for the snapshot format). The Redis codebase is famously clean C and is well worth reading as reference material. You may not copy from it, but studying it to understand the architecture is encouraged.
+
+\item Redis documentation for individual commands at \url{https://redis.io/commands/}. The authoritative reference for what each command in Section 6 is supposed to do. Keep this open while implementing each handler.
+\end{enumerate}
+
+\footerboxes
+\end{document}
