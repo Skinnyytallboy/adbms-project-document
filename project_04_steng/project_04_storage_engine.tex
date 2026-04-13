@@ -1,0 +1,621 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{style_minimal}
+
+\fancyhead[L]{\small\textbf{Project 02}}
+\fancyhead[R]{\small LSM-Tree Storage Engine}
+\fancyfoot[C]{\small\thepage}
+
+\begin{document}
+
+\projecttitle{LSM-Tree Storage Engine}{C or C++}
+
+\section{Problem Statement}
+
+You will build a persistent key-value storage engine from scratch, using the log-structured merge-tree (LSM-tree) design. An LSM-tree is a data structure optimized for fast writes: every write goes to an in-memory buffer and is immediately written to an append-only log on disk, with no seeks and no random I/O. When the in-memory buffer fills up, it is sorted and flushed to disk as an immutable file called a Sorted String Table (SSTable). Reads search the in-memory buffer first, then search each SSTable in turn. Over time, SSTables accumulate, and a background process called compaction merges them to reclaim space, remove deleted keys, and keep read performance from degrading. This is the design used by LevelDB, RocksDB, Cassandra, HBase, InfluxDB, and countless other systems.
+
+The interesting thing about the LSM design is that it achieves fast writes by accepting slower reads, and then tries to make reads fast anyway through a series of clever tricks: keeping SSTables sorted so that a binary search works, adding bloom filters so that you can quickly decide whether a key is \textit{definitely not} in a given SSTable without reading it, and organizing SSTables into tiered ``levels'' so that compaction has a bounded cost. Your implementation will build all of these pieces: the memtable, the WAL, the SSTable writer and reader, the bloom filter, the block cache, the compaction loop, and the read path that combines everything. The result is a library and a small shell that you can use like a miniature LevelDB.
+
+This project differs from the other persistence-heavy project in Project 02 (Option 10, the WAL and crash recovery project) in an important way. The WAL project builds a single-file durable key-value store; the focus is crash recovery and the WAL rule. This project builds a full storage engine with on-disk format design, compaction, and the LSM hierarchy. The overlap is small: both use write-ahead logs for the same reason, but the rest of the project is entirely different. You can (and some students will) do both projects in different semesters and learn quite different things from each.
+
+You are not building a full-featured database. There is no SQL, no transactions beyond single-key atomicity, no concurrent writers, no replication, and no network interface (the engine is used through a shell that links the library directly). The read side is single-threaded; the only background thread is the compaction worker. These simplifications matter: a naive attempt at ``LSM tree like RocksDB'' balloons into thousands of pages of code. The scope here is calibrated so that three 4th-semester undergrads working together can finish in five to seven weeks.
+
+\section{What the Final Product Looks Like}
+
+When your project is complete, you can build the library and a shell that uses it, run the shell, insert some data, observe flushes and compactions, and see the on-disk state evolve. A session looks like this.
+
+\begin{codebox}
+\begin{lstlisting}
+$ make
+$ ./lsmsh --data ./mydb
+lsmsh: opened database at ./mydb
+lsmsh: memtable size limit = 1048576 bytes
+lsmsh: levels: [L0: 0 files, L1: 0 files, L2: 0 files]
+
+> PUT alice 100
+OK
+
+> PUT bob 50
+OK
+
+> PUT carol 75
+OK
+
+> GET alice
+100
+
+> \stats
+memtable:      3 entries, 36 bytes
+wal:           176 bytes
+SSTables:
+  L0: 0 files
+  L1: 0 files
+  L2: 0 files
+
+# insert enough data to force a flush
+> PUT key0001 val0001
+OK
+> PUT key0002 val0002
+OK
+... (many more puts) ...
+> PUT key9999 val9999
+OK
+[memtable full, flushing to L0]
+[flush: wrote 10000 entries to L0/00001.sst (243812 bytes)]
+[wal truncated]
+
+> \stats
+memtable:      0 entries, 0 bytes
+wal:           0 bytes
+SSTables:
+  L0: 1 files (00001.sst, 243812 bytes, keys [alice..key9999])
+  L1: 0 files
+  L2: 0 files
+
+# read from an SSTable this time
+> GET key5000
+val5000
+(read path: memtable miss, L0/00001.sst hit via bloom filter)
+
+# insert more to trigger multiple L0 flushes and compaction
+> BULK insert.txt  # 50000 more operations
+[flush to L0/00002.sst]
+[flush to L0/00003.sst]
+[flush to L0/00004.sst]
+[L0 compaction triggered: 4 files -> L1]
+[compaction: merging 4 L0 files into L1/00005.sst]
+[compaction: done, 240112 entries in L1/00005.sst]
+[L0 files 00001.sst through 00004.sst deleted]
+
+> \stats
+memtable:      0 entries
+wal:           0 bytes
+SSTables:
+  L0: 0 files
+  L1: 1 files (00005.sst, 9.3 MB, keys [alice..key59999])
+  L2: 0 files
+
+> DELETE alice
+OK
+
+> GET alice
+(not found)
+# ^ deletion is a tombstone in the memtable. On disk, alice is still
+# in L1, but the memtable shadowing means GET correctly returns 'not found'.
+
+> \quit
+\end{lstlisting}
+\end{codebox}
+
+The defining moment of this session is the sequence where the memtable fills, flushes to L0, fills again several more times, and then compacts into L1. This is the LSM tree doing its job: absorbing a large burst of writes at the speed of an append-only log, then reorganizing the data in the background to keep reads fast. The \verb|\stats| command lets you watch the on-disk state evolve as this happens. The \texttt{GET} after the \texttt{DELETE} demonstrates that deletion is implemented as a tombstone --- the original value is still in L1, but the tombstone in the memtable shadows it on the read path.
+
+\section{Architectural Overview}
+
+An LSM-tree storage engine has five components. Keep them strictly separated.
+
+\begin{codebox}
+\begin{lstlisting}
+                   [ lsmsh shell ]
+                         |
+                         v
+                  +--------------+
+                  |   LSM API    |  open, get, put, delete, close
+                  +------+-------+
+                         |
+          +--------------+--------------+
+          |              |              |
+          v              v              v
+      +-------+     +-------+     +-----------+
+      |  WAL  |     | Memt. |     |  SSTable  |
+      +---+---+     +---+---+     |  manager  |
+          |             |         +-----+-----+
+          v             v               |
+       wal.log     (in-memory)          |
+                                        v
+                                 +--------------+
+                                 |  Levels      |
+                                 |  L0 (files)  |
+                                 |  L1 (files)  |
+                                 |  L2 (files)  |
+                                 +------+-------+
+                                        |
+                                        v
+                              [ compaction worker,
+                                 background thread ]
+\end{lstlisting}
+\end{codebox}
+
+The WAL is the durability layer: every write hits the log before it is acknowledged. The memtable is the in-memory buffer of recent writes. The SSTable manager knows which SSTable files exist at which levels. The compaction worker merges SSTables to keep the level hierarchy in shape.
+
+\section{The Write Path}
+
+The write path is the simpler of the two. Every \texttt{PUT} or \texttt{DELETE} does the following, in order:
+
+\begin{enumerate}
+\item Serialize the operation as a WAL record.
+\item Append the record to the WAL file.
+\item \texttt{fsync} the WAL file.
+\item Insert the entry into the memtable.
+\item Return success to the caller.
+\end{enumerate}
+
+Steps 1--3 ensure durability: the operation is on stable storage before the caller hears ``OK''. If the process crashes at any point before step 5, the memtable is lost, but the WAL can be replayed on startup to reconstruct exactly what was in the memtable at the moment of the crash. Step 4 makes the operation visible to subsequent \texttt{GET}s without waiting for it to reach disk in sorted form.
+
+When the memtable reaches its size limit (a configurable value, typically 1 to 4 MB), a \textit{flush} occurs:
+
+\begin{enumerate}
+\item The current memtable is made immutable and set aside.
+\item A new empty memtable is created, and new writes start going to it immediately.
+\item The immutable memtable is walked in sorted key order and written to a new SSTable file at level 0. Because the memtable is sorted (see Section 5), this is a single pass.
+\item Once the SSTable is fully written and \texttt{fsync}'d, the WAL is truncated (because every operation in the WAL is now durably stored in the new SSTable).
+\item The SSTable manager is told about the new file so that subsequent \texttt{GET}s will search it.
+\end{enumerate}
+
+A subtle point: step 2 means that writes never block on a flush. The moment the old memtable is marked immutable, a new empty one replaces it, and writes continue at full speed. The flush of the old memtable happens concurrently with new writes going into the new one. This is what gives LSM-trees their fast-write property.
+
+\section{The Memtable}
+
+The memtable is the in-memory buffer of recent writes, kept sorted by key. When a \texttt{GET} arrives, the memtable is searched first; when a flush happens, it is walked in order and written to an SSTable.
+
+\subsection{Data Structure Choice}
+The memtable must support three operations:
+
+\begin{itemize}
+\item \texttt{insert(key, value)}: put a key-value pair, or overwrite an existing one. If the value is a special ``tombstone'' marker, this is a delete.
+\item \texttt{lookup(key)}: return the current value (or tombstone) for a key, or a ``not found'' sentinel.
+\item \texttt{iterate()}: walk all entries in sorted key order.
+\end{itemize}
+
+For this project, use a \textbf{sorted balanced tree}, specifically either a \texttt{std::map<std::string, Value>} in C++ (which is implemented as a red-black tree internally) or a hand-written skip list. Both support all three operations in $O(\log n)$ and both iterate in sorted order. The skip list is more interesting as a teaching exercise and is the data structure real LSM-trees use (LevelDB, RocksDB); a \texttt{std::map} is acceptable if your group decides the extra implementation effort is not worth it.
+
+Do not use an unordered hash map. You need the sorted iteration for the flush, and sorted iteration on a hash map is $O(n \log n)$, which negates the point of maintaining an in-memory buffer.
+
+\subsection{Size Accounting}
+The memtable tracks its own size in bytes so the engine can decide when to flush. The tracked size should be (roughly) the total bytes of all keys plus all values plus some small per-entry overhead. Exact accounting is not important; it is acceptable to overestimate slightly. What matters is that ``memtable full'' is a deterministic, testable condition.
+
+\subsection{Tombstones}
+A \texttt{DELETE} does not remove the entry from the memtable. Instead, it inserts a tombstone: a special value marker meaning ``this key has been deleted.'' Reads encountering a tombstone return ``not found.'' Tombstones flow through the flush and into SSTables, and they remain present during compaction until they have reached the bottom level (see Section 8.4). This is because an older SSTable at a lower level might still contain the deleted key, and the tombstone is the only way to prevent the old value from shadowing the delete.
+
+A tombstone is typically encoded as a one-byte flag in the entry's header, with no value bytes (the value length is zero). Other encodings are acceptable; document yours.
+
+\section{The WAL}
+
+The write-ahead log is a single append-only binary file living in the data directory. It uses the same format as in the WAL project (Option 10), so if you have done that project, you are already familiar with the structure.
+
+\subsection{Record Format}
+
+\begin{codebox}
+\begin{lstlisting}
+Offset  Size   Field           Description
+------  -----  --------------  -------------------------------
+  0      4     crc32           CRC32 of bytes from offset 4
+  4      1     op_type         1 = PUT, 2 = DELETE
+  5      4     key_len         uint32
+  9      4     value_len       uint32, 0 for DELETE
+ 13     ...    key bytes       key_len bytes
+ ...    ...    value bytes     value_len bytes (0 for DELETE)
+\end{lstlisting}
+\end{codebox}
+
+All integers are little-endian. The CRC32 is computed over everything after the checksum field; a mismatch indicates a corrupt record and WAL replay should stop at that point (anything after a corrupt record is treated as if it does not exist).
+
+\subsection{WAL Replay on Startup}
+When the engine opens a database directory, it reads the WAL file from the beginning. For each valid record, it inserts the operation into the memtable, exactly as if a client had just written it. After the replay, the memtable contains everything that was in it at the moment of the last crash or clean shutdown, and the engine is ready to serve reads.
+
+Because flushes truncate the WAL after they finish (Section 4, step 4 of the flush procedure), the WAL contains only the operations not yet in any SSTable, so replay is bounded in size and fast.
+
+\section{SSTables}
+
+A Sorted String Table is an immutable on-disk file containing a sequence of key-value entries in sorted key order, plus some metadata at the end. Once written, an SSTable is never modified; compaction produces new SSTables and deletes old ones rather than updating in place. This immutability is the source of most of the LSM-tree's good properties: reads are safe without locks, crash recovery is easy, and the format can be optimized for sequential I/O because it is never rewritten.
+
+\subsection{File Layout}
+Every SSTable file has the same layout:
+
+\begin{codebox}
+\begin{lstlisting}
++-----------------------+
+| Data block 0          |  ~4 KB of entries
++-----------------------+
+| Data block 1          |
++-----------------------+
+| ... more data blocks  |
++-----------------------+
+| Bloom filter          |  variable size
++-----------------------+
+| Index block           |  one entry per data block
++-----------------------+
+| Footer (fixed 40 B)   |  pointers to the above
++-----------------------+
+\end{lstlisting}
+\end{codebox}
+
+Let me walk through each section.
+
+\subsubsection{Data Blocks}
+A data block is a chunk of roughly 4 KB of sorted entries. An entry is formatted as:
+
+\begin{codebox}
+\begin{lstlisting}
+  1 byte    flag    (0 = PUT, 1 = tombstone)
+  4 bytes   key_len
+  4 bytes   value_len  (0 if tombstone)
+  key_len   key bytes
+  value_len value bytes
+\end{lstlisting}
+\end{codebox}
+
+Entries are written back-to-back with no padding. The block grows until it reaches approximately 4 KB, at which point the current block is closed and a new one started. The 4 KB target is approximate; it is fine for a block to be 4 KB plus however many bytes the current entry needs.
+
+Blocks are not compressed in the base project. Compression is a possible bonus.
+
+\subsubsection{Index Block}
+The index block contains one entry per data block: a (first key in the block, file offset of the block) pair. When searching an SSTable for a key, the index block is consulted first to locate the data block that might contain the key; then the data block is read and scanned.
+
+The index block itself is small --- for a typical 10 MB SSTable with 4 KB data blocks, there are roughly 2500 data blocks, so the index has 2500 entries. At roughly 20--50 bytes per entry, the index is under 100 KB, small enough to keep in memory whenever the SSTable is open.
+
+\subsubsection{Bloom Filter}
+The bloom filter is the per-SSTable shortcut that makes LSM-tree reads fast. See Section 9.
+
+\subsubsection{Footer}
+The last 40 bytes of the file are the footer, which contains:
+
+\begin{codebox}
+\begin{lstlisting}
+  8 bytes   bloom_offset
+  8 bytes   bloom_size
+  8 bytes   index_offset
+  8 bytes   index_size
+  8 bytes   magic (ASCII bytes 'L','S','M','T','A','B','L','E')
+\end{lstlisting}
+\end{codebox}
+
+When the SSTable is opened, the reader seeks to the last 40 bytes, verifies the magic, and uses the offsets and sizes to locate the bloom filter and index block. Both are read into memory and kept there for the lifetime of the open SSTable. Data blocks are read on demand during \texttt{GET} operations.
+
+\subsection{Writing an SSTable}
+Writing an SSTable from an iterator of sorted entries (either a flushing memtable or the merged output of a compaction) goes:
+
+\begin{enumerate}
+\item Open a temporary file in the data directory, e.g. \texttt{00042.sst.tmp}.
+\item Walk the input iterator, accumulating entries into the current data block. When the block exceeds 4 KB, write it to the file, record its offset and first key in a running index, and start a new block. Meanwhile, add every key seen to the bloom filter.
+\item When the iterator is exhausted, write the final (possibly short) data block.
+\item Write the bloom filter to the file; record its offset and size.
+\item Write the index block to the file; record its offset and size.
+\item Write the 40-byte footer.
+\item \texttt{fsync} the file.
+\item \texttt{rename} the temporary file to its final name, \texttt{00042.sst}. On POSIX, \texttt{rename} is atomic: a reader that was about to open the file either sees the old name or sees the new name, never a half-renamed state.
+\end{enumerate}
+
+The temp-file-and-rename pattern is critical. A crash during step 2 or 4 must not leave behind a file that looks like a valid SSTable but is truncated. Using a distinct temporary name until \texttt{fsync} succeeds ensures this.
+
+\subsection{Reading from an SSTable}
+Looking up a key in a specific SSTable:
+
+\begin{enumerate}
+\item Consult the bloom filter (Section 9). If the filter says the key is definitely not present, return ``not found'' immediately without any further I/O.
+\item Binary search the index block for the block that might contain the key. The block whose first key is the largest first key $\leq$ the target key is the candidate.
+\item Read the candidate data block from disk (a single sequential read of about 4 KB).
+\item Walk the entries in the block linearly, comparing each key to the target. If found, return the value (or tombstone). If the end of the block is reached without a match, return ``not found.''
+\end{enumerate}
+
+This is one disk seek (the data block read) in the worst case, or zero if the bloom filter rejects the key.
+
+\section{The Read Path and Level Hierarchy}
+
+When a \texttt{GET} arrives, the engine must find the \textit{newest} occurrence of the key across all of memtable, WAL (implicit via memtable), and every SSTable in the hierarchy. Newer entries shadow older ones.
+
+\subsection{Read Order}
+Search in this order, stopping at the first hit:
+
+\begin{enumerate}
+\item The current memtable. If the key is found (as a value or as a tombstone), return that result.
+\item Each level, starting from L0 and going down to the bottom level.
+\end{enumerate}
+
+Within a level, the search strategy depends on the level, as explained next.
+
+\subsection{Levels}
+SSTables live in \textit{levels}, numbered from 0. For this project, implement three levels: L0, L1, and L2. Each level has distinct properties.
+
+\textbf{Level 0 (L0)}: contains SSTables produced directly by memtable flushes. The files in L0 may have overlapping key ranges, because each one is the result of a separate memtable flush and two different memtables will often contain some of the same keys (the second flush overrides values written in the first). A \texttt{GET} against L0 must search every L0 SSTable until a hit is found, in order from newest to oldest.
+
+\textbf{Level 1 (L1)}: contains SSTables produced by compacting L0 files together. The files in L1 have \textit{non-overlapping} key ranges: each file covers a distinct slice of the keyspace. A \texttt{GET} against L1 can use the index of L1 files (kept in memory by the SSTable manager) to find the single file whose range contains the target key, and then only that one file needs to be searched.
+
+\textbf{Level 2 (L2)}: contains SSTables produced by compacting L1 into L2. Like L1, the files have non-overlapping ranges. Searches at L2 also touch exactly one file.
+
+The progression L0 $\to$ L1 $\to$ L2 is one of increasing file size and decreasing overlap. L0 files are small (one per memtable flush) and may overlap; L1 and L2 files are large and do not overlap. This layout is the standard ``leveled'' LSM-tree compaction strategy used by LevelDB.
+
+\subsection{Putting It Together}
+A complete read for key $k$:
+
+\begin{enumerate}
+\item Check the memtable. If found, return.
+\item For each L0 SSTable, in newest-first order: consult its bloom filter; if the filter says ``maybe,'' read the SSTable. If found, return.
+\item Find the L1 SSTable whose key range contains $k$ (at most one exists). Consult its bloom filter; if ``maybe,'' read. If found, return.
+\item Same for L2.
+\item Return ``not found.''
+\end{enumerate}
+
+The critical efficiency comes from the bloom filters. Without them, every read would touch every L0 file plus one L1 file plus one L2 file. With them, reads that miss return after consulting a few filters in memory and doing no I/O at all.
+
+\section{Bloom Filters}
+
+A bloom filter is a small, compact data structure that can answer ``is this item in the set?'' with a ``definitely no'' or ``probably yes'' response. It cannot answer ``definitely yes'' --- there is always a small probability of a false positive. The tradeoff is size: a bloom filter is a small fraction of the size of the set it represents (typically about 10 bits per element), so it can sit in memory comfortably while the actual data stays on disk.
+
+For the LSM-tree, bloom filters are used to avoid unnecessary disk reads. Before touching a data block in an SSTable, the engine asks the SSTable's bloom filter whether the key might be in it. If the answer is ``no,'' the engine moves on without reading from disk. If the answer is ``yes,'' the engine reads and searches the data block as usual; if the key turns out not to be there after all, that is a false positive.
+
+\subsection{Implementation}
+A bloom filter is a bit array of length $m$ and a set of $k$ hash functions. To insert an item, compute the $k$ hashes of the item mod $m$, and set the corresponding $k$ bits in the array. To test for presence, compute the same $k$ hashes, and check whether all $k$ bits are set; if any of them is clear, the item is definitely not present.
+
+For this project, use a fixed size of $m = 10 \cdot n$ bits where $n$ is the expected number of items in the SSTable (you know this because you know how many entries you are about to write), and $k = 7$ hash functions. These numbers produce a false positive rate of approximately 1\%, which is the standard target.
+
+You do not need seven independent hash functions. The standard trick is to use just two hash functions and combine them:
+\[
+h_i(x) = (h_1(x) + i \cdot h_2(x)) \bmod m \qquad \text{for } i \in [0, k)
+\]
+This gives you $k$ ``different'' hashes from two real ones, and the false positive rate is the same in practice. Use FNV-1a for $h_1$ and a second hash (for example, a simple multiplicative hash with a different seed) for $h_2$.
+
+\subsection{Serialization}
+The bloom filter is written as part of the SSTable:
+
+\begin{codebox}
+\begin{lstlisting}
+  4 bytes   m (bit array length in bits)
+  4 bytes   k (number of hash functions)
+  ceil(m/8) bytes   bit array
+\end{lstlisting}
+\end{codebox}
+
+When the SSTable is opened, the reader loads the bit array into memory and keeps it there. For a typical 10 MB SSTable containing 100{,}000 entries, the filter is about 125 KB, small enough that keeping all bloom filters for all open SSTables in memory is not a concern.
+
+\section{Compaction}
+
+Without compaction, an LSM-tree grows without bound: every flush creates a new L0 file, deleted keys keep their tombstones forever, and reads get slower as more files accumulate. Compaction is the background process that keeps the tree in shape by merging SSTables to produce larger, non-overlapping ones at the next level down.
+
+\subsection{When to Compact}
+The compaction worker is a background thread that wakes up periodically (every few seconds) and checks whether any level needs compaction.
+
+\textbf{L0 compaction trigger}: L0 has accumulated at least 4 files. All L0 files are selected as input; together with any L1 files whose key ranges overlap the combined L0 range, they are compacted into L1. After compaction, L0 is empty and L1 has been updated.
+
+\textbf{L1 compaction trigger}: L1's total size exceeds a threshold (for this project, use 10 MB as the threshold). Pick one L1 file and any L2 files whose ranges overlap it, and merge them into L2.
+
+\textbf{L2 compaction}: not needed in this project. L2 is the bottom level; no compaction runs there. This limits the maximum amount of data the engine can handle, but it is a fair simplification for a 5-to-7-week project.
+
+\subsection{The Merge Algorithm}
+Compaction is a k-way merge: given several sorted inputs (the SSTables to be compacted), produce a single sorted output. The classic approach is a priority queue (a min-heap) keyed by current entry:
+
+\begin{enumerate}
+\item Open an iterator on each input SSTable.
+\item Create a min-heap. For each input, read its first entry and push $(entry, input\_id)$ onto the heap.
+\item Pop the smallest entry from the heap. This is the next entry to write to the output.
+\item Advance the input that produced this entry; if it has a next entry, push it onto the heap.
+\item Repeat until the heap is empty.
+\end{enumerate}
+
+Because the inputs are all sorted, the heap is always small (one entry per input, so size $k$ where $k$ is the number of inputs, typically 5--10), and the merge is $O(n \log k)$ where $n$ is the total number of entries. For this project a simple approach is fine: even without a heap, a linear scan of ``find the smallest head entry across all inputs'' is $O(n k)$, which for small $k$ is still very fast.
+
+\subsection{Handling Duplicate Keys}
+When two inputs both have an entry for the same key, only the newer one should appear in the output. ``Newer'' is defined by SSTable age: the SSTable produced by a more recent flush or compaction is newer. If you track SSTables by a monotonically increasing file number (recommended: \texttt{00001.sst}, \texttt{00002.sst}, etc.), the higher-numbered file is newer.
+
+When the merge encounters multiple heap entries with the same key, pop all of them, keep the one from the newest input, and discard the rest. The kept entry is written to the output.
+
+\subsection{Tombstone Collection}
+Compaction is also where tombstones are finally removed. The rule:
+
+\begin{itemize}
+\item If a tombstone is being written to any level \textit{except} the bottom level (L2 in this project), keep it. There might be older data below that needs to be shadowed.
+\item If a tombstone is being written to the bottom level, and the key does not exist anywhere above the bottom level, drop the tombstone entirely. There is no older value to shadow, so the tombstone is no longer needed.
+\end{itemize}
+
+For the base project, it is acceptable to always keep tombstones through L0 and L1, and drop them only when they reach L2. This is slightly less efficient than the optimal rule but is simpler to implement and will not meaningfully affect benchmark scores.
+
+\subsection{Atomicity of Compaction}
+Compaction must be atomic from the reader's point of view: a \texttt{GET} running concurrently with a compaction must either see the old SSTables (before the compaction) or the new ones (after), never a mixture. The standard way to achieve this is a \textit{manifest} file:
+
+The SSTable manager keeps a small in-memory structure listing which files are ``live'' at each level. This structure is also periodically persisted to a manifest file so that the engine can reload it on startup. When a compaction completes, the worker atomically swaps the manifest: the old SSTables are removed from the list and the new one is added, all within a single lock acquisition. Readers that had already started a search with the old list continue with those files; new searches see the new list. Only after all in-flight searches have finished with an old file can the file be physically deleted.
+
+For this project, a simpler approach works: take the SSTable manager's lock, update the in-memory list, release the lock, and immediately delete the old files on disk. This is technically unsafe if a \texttt{GET} was in the middle of reading an old file, but in practice the window is narrow, and the simpler code is worth the risk for a class project. Document your choice.
+
+\subsection{Persisting the Level Layout}
+On startup, the engine needs to know which SSTable files exist and which level each belongs to. The simplest approach is to name files with their level embedded: \texttt{L0\_00001.sst}, \texttt{L1\_00042.sst}, etc. At startup, list the directory, parse each file name, and rebuild the level hierarchy. If you prefer a manifest file (a small binary file listing the current files per level, updated on every compaction), that is also fine; document your choice.
+
+\section{Phase 1 --- Memtable, WAL, and Basic Shell}
+
+The goal of Phase 1 is a working engine with an in-memory memtable and a durable WAL, but no SSTables yet. Everything fits in memory, and crashes are recovered by replaying the WAL.
+
+Build these components:
+
+\begin{itemize}
+\item The memtable: a sorted map from string keys to value-or-tombstone entries, with a byte counter, and support for insert, lookup, and in-order iteration.
+
+\item The WAL writer: append-only binary file with CRC-checked records, \texttt{fsync} on every write, using the format from Section 6.1.
+
+\item The WAL replay on startup: read all records, rebuild the memtable.
+
+\item The LSM API: a small C or C++ interface with \texttt{open(path)}, \texttt{get(key)}, \texttt{put(key, value)}, \texttt{delete(key)}, and \texttt{close()}. At this stage, \texttt{put} and \texttt{delete} write to the WAL and then insert into the memtable; \texttt{get} checks only the memtable.
+
+\item The \texttt{lsmsh} shell: a REPL that reads commands (\texttt{PUT}, \texttt{GET}, \texttt{DELETE}, \texttt{STATS}, \texttt{QUIT}) and calls the LSM API. The \texttt{STATS} command prints the memtable size and the WAL size.
+
+\item A unit test suite that covers: memtable insert/lookup/iteration, WAL serialization round trip, crash-recovery by writing data, killing the process, and verifying all operations are present on restart.
+\end{itemize}
+
+At the end of Phase 1 you have a working in-memory key-value store with crash recovery. Insert a million entries and it will all live in RAM; kill the process and restart, and the memtable is rebuilt from the WAL. The next phase adds the on-disk half of the engine.
+
+\section{Phase 2 --- Flushes, SSTables, and the Read Path}
+
+The goal of Phase 2 is to add the SSTable write path, the SSTable read path with bloom filters, and the flush mechanism that moves data from the memtable to L0.
+
+Build these components:
+
+\begin{itemize}
+\item The bloom filter: insert, contains, serialize, deserialize. Unit test the false positive rate: insert $n$ known items, query $10n$ non-member items, verify the fraction of false positives is close to 1\%.
+
+\item The SSTable writer: given a sorted iterator of entries, write a complete SSTable file following the layout in Section 7.1. Use the temp-file-and-rename pattern.
+
+\item The SSTable reader: open an SSTable file, verify the footer and magic, load the bloom filter and index into memory, and provide a lookup function that takes a key and returns a value or ``not found.''
+
+\item The SSTable manager: keep a list of open SSTables per level. For now only L0 is used.
+
+\item The flush path: when the memtable reaches its size limit, lock the memtable, mark it immutable, create a new empty memtable, release the lock, and in the same thread (or a dedicated flush thread) write the immutable memtable to a new L0 SSTable file. Once the SSTable is written and \texttt{fsync}'d, truncate the WAL.
+
+\item The updated \texttt{get} path: check the memtable first, then walk the L0 SSTables newest-first, consulting bloom filters before reading data blocks.
+
+\item Startup logic that discovers existing SSTable files in the data directory and loads them into the SSTable manager at the correct level.
+\end{itemize}
+
+At the end of Phase 2, inserting enough data to overflow the memtable should produce visible SSTable files in the data directory, and reads for keys in those SSTables should succeed via the bloom-filter-plus-index path. The read path should transparently shadow old SSTable values with newer memtable values when the same key is written twice (once before a flush, once after).
+
+\subsection{Testing Phase 2}
+In addition to unit tests, write an integration test that:
+
+\begin{enumerate}
+\item Inserts 100{,}000 distinct keys, enough to produce several L0 SSTables.
+\item For each key, verifies the read returns the expected value.
+\item Overwrites 10{,}000 of the keys with new values.
+\item Reads each overwritten key and verifies the new value is returned (the memtable correctly shadowing older SSTable values).
+\item Deletes 5{,}000 of the keys.
+\item Reads each deleted key and verifies ``not found'' is returned.
+\item Kills the process, restarts it, and repeats the verifications. Every observation should match.
+\end{enumerate}
+
+\section{Phase 3 --- Compaction and Benchmark}
+
+The goal of Phase 3 is to add the compaction worker, the L1 and L2 levels, and a benchmark report.
+
+Build these components:
+
+\begin{itemize}
+\item L1 and L2 support in the SSTable manager, with per-level file lists and (for L1 and L2) in-memory range indexes for fast single-file lookup.
+
+\item The merge-sort k-way iterator over multiple SSTables, handling duplicate keys by newest-wins.
+
+\item The compaction worker: a background thread that wakes up periodically, checks the L0 and L1 compaction triggers from Section 8.1, and runs a compaction when one fires. Compactions write their output as new SSTables at the next level down, update the SSTable manager, and delete the input files.
+
+\item Tombstone collection at L2.
+
+\item Atomicity of compaction (either via a manifest file or the simpler locked-update approach described in Section 8.5).
+
+\item Updated read path that searches L0, then L1, then L2 in order.
+\end{itemize}
+
+\subsection{Benchmark}
+Write a benchmark program that measures engine performance. Run these workloads and record the numbers:
+
+\begin{itemize}
+\item \textbf{Bulk insert}: insert 1{,}000{,}000 random key-value pairs (keys as 16-byte random strings, values as 100-byte random strings). Report puts per second, total time, and the final on-disk size after compaction has settled.
+
+\item \textbf{Random read (hot)}: after the bulk insert, read 100{,}000 random keys that are known to exist. Report reads per second.
+
+\item \textbf{Random read (miss)}: read 100{,}000 keys that are known \textit{not} to exist. Report reads per second. This measures the effectiveness of the bloom filters; if the filters work, miss reads should be nearly as fast as hit reads.
+
+\item \textbf{Mixed workload}: run 100{,}000 operations with 50\% random reads and 50\% random writes. Report operations per second.
+
+\item \textbf{Read amplification}: for the random-read workload above, instrument the engine to count how many SSTables were consulted per read (including filter hits and filter misses). Report the distribution: mean, median, 95th percentile.
+
+\item \textbf{Space amplification}: after bulk-inserting 1{,}000{,}000 entries, report the total bytes on disk divided by the theoretical ``ideal'' size (if each key-value pair were stored exactly once with no overhead).
+\end{itemize}
+
+A successful submission sustains at least 50{,}000 puts per second and at least 20{,}000 random reads per second on a modern laptop. Read amplification for existing keys should average under 2 (at most two SSTables consulted per hit), and space amplification should be under 2 (at most twice the ideal size). If your numbers are significantly worse, profile and fix the worst regression before submitting.
+
+\section{Deliverables and Submission}
+
+\subsection{What to Submit}
+A single zip archive containing:
+
+\begin{itemize}
+\item The complete source tree of your implementation, including the LSM library, the \texttt{lsmsh} shell, and the benchmark program.
+
+\item A \texttt{Makefile} (or \texttt{CMakeLists.txt}) that builds everything with a single command on a recent Ubuntu LTS using only the standard C/C++ toolchain.
+
+\item A \texttt{README.md} with build instructions, a list of supported shell commands, and any known limitations.
+
+\item A \texttt{design.pdf} document of at most 12 pages describing: the five-component architecture and the separation between them; the memtable data structure and size accounting; the WAL format; the SSTable file layout, including data blocks, bloom filter, index, and footer; the bloom filter parameters and why they produce ~1\% false positive rate; the level hierarchy and compaction triggers; the merge algorithm for compaction; tombstone handling and collection; and a discussion of the benchmark results, especially the read amplification and space amplification numbers.
+
+\item A \texttt{benchmark/} directory with the benchmark program and the output of your final run.
+
+\item A \texttt{tests/} directory with unit tests for: the memtable, the WAL serializer and replay, the bloom filter (including the false positive rate test), the SSTable writer and reader round trip, the merge iterator, and the end-to-end engine (the Phase 2 integration test extended to cover compaction).
+\end{itemize}
+
+\subsection{Archive Naming}
+\texttt{Group[Number]\_Project02\_LSMTree.zip}, for example \texttt{Group17\_Project02\_LSMTree.zip}.
+
+\subsection{Demonstration}
+Each group will present a 25-minute live demonstration during the week following the submission deadline. It consists of three parts. First, a walkthrough of the architecture and of the SSTable file layout using the design document. Second, a live session with the shell, inserting data and observing flushes and compactions, followed by running the benchmark against a freshly built database, with the instructor free to propose adjustments to the benchmark parameters on the spot. Third, a short oral examination in which each group member will be asked to explain, without notes, a specific component of the implementation, with particular focus on why the WAL is truncated after the flush completes and what would go wrong if it were truncated before, and how the bloom filter's two-hashes-combined trick actually gives you $k$ hashes. All group members must be present. Missing the demonstration results in a zero for Phase 3.
+
+\section{Bonus Opportunities}
+
+Each of the following is independent. Bonus credit is awarded on top of the base grade up to a maximum of 15 percentage points. To claim bonus credit, your design document must include a dedicated section explaining which items you attempted and how you verified them.
+
+\subsection{Block Cache (up to 5\%)}
+Add an in-memory LRU cache for recently read data blocks. The cache has a bounded size in bytes (say, 16 MB by default) and evicts least-recently-used blocks when full. Every \texttt{GET} consults the cache before reading from disk; block reads that hit the cache avoid I/O entirely. Measure the speedup on a workload with strong temporal locality (reading the same 1000 keys over and over) and report the hit rate in the benchmark output.
+
+\subsection{Snappy-Style Compression (up to 5\%)}
+Add a simple compression scheme to data blocks. Snappy is a popular choice in production LSM engines; for this bonus, you may either implement a simple run-length-encoding or LZ77-style compressor yourself, or use the \texttt{zlib} library (which is an allowed dependency for this bonus only, not the base project). Measure the compression ratio on a realistic workload and the impact on read/write throughput.
+
+\subsection{Parallel Compaction (up to 5\%)}
+The base project uses a single background compaction thread. Implement a compaction scheduler that can run multiple compactions in parallel on disjoint key ranges of the same level. Describe the locking strategy in the design document and demonstrate throughput improvement on a write-heavy workload.
+
+\section{Constraints and Prohibitions}
+
+\begin{notebox}[The Following Will Result in Loss of Credit]
+\begin{itemize}
+\item Use of any existing LSM-tree, B-tree, or embedded key-value store as a component of your implementation. This includes but is not limited to LevelDB, RocksDB, LMDB, BoltDB, BerkeleyDB, BadgerDB, WiredTiger, SQLite, Redis, and their language bindings.
+
+\item Use of any existing bloom filter library. Write your own; it is fewer than 100 lines of code.
+
+\item Use of any existing serialization library (Protobuf, Cap'n Proto, FlatBuffers, MessagePack). The on-disk formats in Sections 6 and 7 must be implemented with direct reads and writes.
+
+\item Use of \texttt{zlib} or any other compression library in the base project. Compression is only allowed as a bonus with explicit opt-in.
+
+\item Skipping \texttt{fsync} on WAL writes or on SSTable writes. The durability argument depends on both.
+
+\item Truncating the WAL before the new SSTable is fully durable. This is a classic ordering bug: if the SSTable is lost and the WAL has already been truncated, the data is gone forever. The order must be: write the SSTable, \texttt{fsync} it, \texttt{rename} it, \textit{then} truncate the WAL.
+
+\item Using a hash map for the memtable. The flush requires sorted iteration, so the memtable must be a sorted data structure.
+
+\item Storing SSTable entries in unsorted order. Sorted order within each SSTable is what makes binary search via the index block work.
+
+\item Use of Python at any layer, including test harnesses and benchmark drivers. Tests and scripts must be written in C, C++, shell, or JavaScript.
+
+\item Submitting code whose commit history shows large, infrequent commits. The incremental nature of an engine of this size should be visible in your git log.
+\end{itemize}
+\end{notebox}
+
+\section{Required Reading}
+
+The first item is required reading before Phase 1. The second is required before Phase 3. The remaining items are reference material.
+
+\begin{enumerate}
+\item O'Neil, P., Cheng, E., Gawlick, D., and O'Neil, E. ``The Log-Structured Merge-Tree (LSM-Tree).'' \textit{Acta Informatica}, 33(4):351--385, 1996. The original LSM-tree paper. Sections 1 and 2 are the important ones; the rest is more detailed than you need. Read before Phase 1.
+
+\item Bloom, B. H. ``Space/Time Trade-offs in Hash Coding with Allowable Errors.'' \textit{Communications of the ACM}, 13(7):422--426, 1970. The original bloom filter paper. Short and readable. Read before Phase 3.
+
+\item The LevelDB documentation, specifically the files \texttt{doc/impl.md} and \texttt{doc/table\_format.md} in the LevelDB source tree, freely available on GitHub. These describe exactly the design you are building, written by its original implementers. Useful reference throughout the project.
+
+\item Kleppmann, M. \textit{Designing Data-Intensive Applications}, Chapter 3 (``Storage and Retrieval''), sections on log-structured storage and SSTables. The clearest modern introduction to the ideas in this project, aimed at engineers rather than researchers.
+
+\item Kirsch, A. and Mitzenmacher, M. ``Less Hashing, Same Performance: Building a Better Bloom Filter.'' \textit{European Symposium on Algorithms}, 2006. The paper that justifies the two-hashes-combined trick used in Section 9. Optional but reassuring.
+
+\item Sears, R. and Ramakrishnan, R. ``bLSM: A General Purpose Log Structured Merge Tree.'' \textit{ACM SIGMOD}, 2012. A more sophisticated LSM variant. Optional reading for students curious about how production engines handle the issues that this project glosses over.
+\end{enumerate}
+
+\footerboxes
+\end{document}
